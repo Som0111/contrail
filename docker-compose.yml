@@ -50,7 +50,9 @@ services:
     networks: [contrail]
 
   api:
-    build: .
+    build:
+      context: .
+      target: base
     env_file:
       - path: .env
         required: false
@@ -69,6 +71,21 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    networks: [contrail]
+
+  # `docker compose run --rm tests` -- not started by `docker compose up`.
+  tests:
+    build:
+      context: .
+      target: dev
+    profiles: [dev]
+    volumes:
+      - ./src:/app/src
+      - ./tests:/app/tests
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:29092
+      POSTGRES_HOST: timescaledb
+      REDIS_URL: redis://redis:6379/0
     networks: [contrail]
 
 volumes:
