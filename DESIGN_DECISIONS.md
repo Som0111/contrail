@@ -51,3 +51,36 @@ function that knows nothing about which source it is draining. Phase 2.4's OpenS
 second implementation rather than a fork of the publish path. Alternative: write it straight for the
 synthetic source and generalise later. Rejected because the roadmap explicitly depends on the
 interface existing now, and it is about six lines.
+
+## 0.3 — Idempotency key is `(icao24, event_time)`, enforced by the database
+An aircraft has exactly one state at one instant, so the natural key is already unique — no
+synthetic id needed. Alternative considered: a producer-minted message UUID. Rejected because a
+UUID only dedups *redeliveries of the same message*; it would happily insert two rows for the
+generator's duplicate-emission chaos, since those are two messages describing one event. The
+natural key catches both cases with the same constraint. TimescaleDB requires a unique index to
+include the partitioning column, and `event_time` is that column, so the constraint costs nothing
+extra. The cost is that a genuine correction to an already-stored event would be dropped rather
+than applied; if that ever matters the fix is `ON CONFLICT ... DO UPDATE`, not a different key.
+
+## 0.3 — At-least-once delivery, made safe by the write, not by the consumer
+The sink commits offsets only after the batch is durably written, and carries no dedup cache,
+no transactional producer, no exactly-once machinery. Alternative: Kafka transactions for
+end-to-end exactly-once. Rejected as a large amount of coordination to buy a guarantee the unique
+constraint already gives us for one line of SQL, and one that would not survive the pipeline being
+restarted against a fresh consumer group anyway. The crash window this deliberately leaves open —
+written but not committed — is exercised directly by the kill test, which sees 86-124 records
+re-delivered and absorbed per run.
+
+## 0.3 — First proof point for core claim #3 (determinism)
+Two integration tests, both against live Redpanda and TimescaleDB rather than mocks, since the
+property under test belongs to the constraint and the commit ordering: replaying an identical batch
+through a fresh consumer group inserts zero new rows and leaves the row count untouched; and
+`SIGKILL`-ing the sink process mid-stream then restarting it lands on exactly the unique-event count
+with zero duplicate keys. Phase 1.6 extends this from "same row count" to "byte-identical aggregate
+output".
+
+## 0.3 — Correlation id derived from the event, not minted at random
+`trace_id` is `blake2s(icao24|event_time)`. Alternative: a random UUID per consumed message.
+Rejected on two counts — a random id differs between a run and its replay, which would make the
+Phase 1.6 output hash unstable, and it would give the two copies of a duplicated event different
+ids, hiding exactly the relationship an operator is trying to see in the logs.

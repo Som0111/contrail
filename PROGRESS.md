@@ -44,3 +44,25 @@ roadmap) because no Python 3.12 exists on the host. Chose the lat/lon grid over 
 DESIGN_DECISIONS.md.
 Known issues: Grid cells are unequal-area near the poles, so partition load is mildly skewed.
 Contained to `grid_cell()` if it ever matters.
+
+## [Phase 0.3] — 2026-08-27
+Built: `storage/timescale.py` — `flight_events` hypertable on `event_time` with
+`UNIQUE (icao24, event_time)`, batched `INSERT ... SELECT unnest(...) ON CONFLICT DO NOTHING`
+returning the count of genuinely new rows (so suppression is measurable, not assumed), and a
+deterministic `trace_id()`. `ingestor/sink.py` — `AIOKafkaConsumer` with `enable_auto_commit=False`
+that writes each batch then commits, exiting on an idle timeout or SIGTERM. `common/logging.py` —
+JSON-line formatter; every batch logs consumed/inserted/suppressed, a trace id and the per-partition
+offset range.
+Verified: 15 tests pass (12 unit, 3 integration), `ruff check` clean. Replay: producing a fixed
+1,050-message batch containing real duplicates, draining it, then re-reading the whole topic from
+offset 0 with a fresh consumer group — second pass consumed all 1,050 records, inserted 0, row count
+unchanged at 950. Kill: `SIGKILL` on the sink *process* (not a cancelled task) mid-stream, then
+restart on the same group — ran 3x, killed at 184/409/552 of 950 rows, restart re-read 890/640/440
+records of which 124/99/86 were suppressed as already-written, and every run finished at exactly 950
+rows with zero duplicate `(icao24, event_time)` keys. Integration suite run 3x back-to-back, no
+flakiness.
+Deviations: None.
+Known issues: The suppressed counter mixes two causes — redelivery after the crash and the
+generator's own duplicate-emission chaos — so it is not a clean measure of redelivery alone. The
+proof does not depend on separating them (`final == unique` and zero duplicate keys do the work),
+but `scripts/phase0_report.py` in 0.4 should report the two separately.

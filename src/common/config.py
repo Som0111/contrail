@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     kafka_bootstrap: str = "redpanda:29092"
     kafka_raw_topic: str = "flight.events.raw"
     kafka_partitions: int = 6
+    kafka_consumer_group: str = "contrail-sink"
 
     # Synthetic generator. Chaos knobs are config-driven so Phase 1 can sweep them.
     gen_aircraft: int = 50
