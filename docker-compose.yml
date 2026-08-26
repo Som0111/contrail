@@ -82,6 +82,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
+      - ./scripts:/app/scripts
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       POSTGRES_HOST: timescaledb

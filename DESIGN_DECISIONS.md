@@ -84,3 +84,22 @@ output".
 Rejected on two counts — a random id differs between a run and its replay, which would make the
 Phase 1.6 output hash unstable, and it would give the two copies of a duplicated event different
 ids, hiding exactly the relationship an operator is trying to see in the logs.
+
+## 0.4 — The report reconciles two independent sources, not one
+`scripts/phase0_report.py` reads the message count from Redpanda's own partition offsets and the
+row count from TimescaleDB, then asserts `stored + suppressed == received`. Alternative: have the
+generator report how many events it emitted and compare against the database. Rejected because the
+generator's intent is not evidence — if the producer silently failed to send, an intent-based report
+would still balance. Offsets and rows are two things the pipeline actually did, so the identity only
+holds if the whole path worked. The observable consequence is that `drop_prob` is invisible to the
+report by construction: a dropped event never reaches the topic, so it cannot be counted, only
+inferred by comparing against the generator's configured rate.
+
+## 0.4 — The sink claims the topic's partition count too
+Subscribing a consumer to a missing topic auto-creates it with a single partition. Starting the sink
+before the generator therefore silently capped the pipeline at one partition — caught during the
+Phase 0 integration run, when the sink was assigned only `partition=0`. Alternative: turn off broker
+auto-creation, or document a required start order. Rejected both: a documented ordering constraint
+is a trap that fires under Compose restarts, and disabling auto-create turns the mistake into a
+crash somewhere less obvious. Instead the sink calls the same idempotent `ensure_topic()` the
+producer does, so whichever starts first creates the topic with the configured partition count.

@@ -66,3 +66,37 @@ Known issues: The suppressed counter mixes two causes — redelivery after the c
 generator's own duplicate-emission chaos — so it is not a clean measure of redelivery alone. The
 proof does not depend on separating them (`final == unique` and zero duplicate keys do the work),
 but `scripts/phase0_report.py` in 0.4 should report the two separately.
+
+## [Phase 0.4] — 2026-08-27
+Built: `scripts/phase0_report.py` only — no new pipeline features. It reads message counts from
+Redpanda's partition offsets and row counts/disorder statistics from TimescaleDB, and reconciles the
+two. Created `BENCHMARKS.md` with a header (missed in 0.1; Phase 1 fills it in).
+Verified: 5-minute end-to-end run, generator -> Redpanda -> sink -> TimescaleDB, at 60 aircraft x
+2 Hz with chaos ooo 0.15 / max-skew 8s / dup 0.05 / late 0.02 at 90s / drop 0.01. Generator
+published 37,491 messages; sink consumed 37,491, inserted 35,643, suppressed 1,848. Report output
+reconciles exactly (35,643 + 1,848 == 37,491) and every chaos knob is recoverable from it:
+duplicates 4.93% (configured 5%), drops 357 of 36,000 generated = 0.99% (configured 1%), events
+later than the 60s bound 1.89% (configured 2%), arrival-lag p95 6.23s (under the configured 8s
+max skew), max 179.86s (under 2x the configured 90s late delay). Event-time inversions 8.45% of
+stored rows. Traffic spread over all 6 partitions and 70 geographic cells, 60 distinct aircraft,
+event_time span exactly 300s. Full clean-boot check: `docker compose down -v --remove-orphans`
+then `docker compose up -d` — all four services healthy in 13.5s with no manual steps, `/healthz`
+200 with all three dependencies ok. 15 tests pass, `ruff check src tests scripts` clean.
+Deviations: Found and fixed a real bug during the run rather than working around it — the sink
+auto-created the topic with one partition when it started before the generator, silently capping
+parallelism. The sink now calls the same `ensure_topic()` the producer does. Also mounted
+`./scripts` into the `tests` container so lint covers it.
+Known issues: None carried forward. The 0.3 note about the `suppressed` counter mixing redelivery
+with generator duplicates is resolved for reporting purposes — the report derives duplicates from
+topic-vs-table reconciliation, which is unambiguous.
+
+### Phase 0 exit gate
+- [x] `docker compose up` works from a clean checkout with no manual steps (verified after
+      `down -v`, 13.5s to all-healthy)
+- [x] Generator chaos parameters are config-driven and verified by tests (12 unit tests; rates
+      measured within 10% relative over 20,000-event samples)
+- [x] Idempotent sink proven under consumer restart (0.3: SIGKILL mid-stream x3, exact unique row
+      count, zero duplicate keys, 86-124 records re-delivered and absorbed per run)
+- [x] `phase0_report.py` output is internally consistent (stored + suppressed == received, and all
+      four chaos rates recoverable from the output)
+- [x] `DESIGN_DECISIONS.md` has entries for partitioning scheme (0.2) and idempotency key (0.3)

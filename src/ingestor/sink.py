@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from aiokafka import AIOKafkaConsumer
 
 from src.common.config import get_settings
+from src.ingestor.base import ensure_topic
 from src.common.logging import configure
 from src.common.models import FlightState
 from src.storage import timescale
@@ -38,8 +39,13 @@ async def run(
     batch_size: int = 500,
     poll_timeout_ms: int = 1000,
     idle_timeout_s: float | None = None,
+    partitions: int | None = None,
     stop: asyncio.Event | None = None,
 ) -> SinkStats:
+    # Subscribing to a missing topic auto-creates it with ONE partition, which
+    # would silently cap parallelism. Claim the right shape regardless of whether
+    # the consumer or the producer starts first.
+    await ensure_topic(bootstrap, topic, partitions or get_settings().kafka_partitions)
     pool = await timescale.connect(dsn, min_size=1, max_size=4)
     await timescale.ensure_schema(pool)
 
@@ -113,6 +119,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--group", default=s.kafka_consumer_group)
     p.add_argument("--dsn", default=s.postgres_dsn)
     p.add_argument("--batch-size", type=int, default=500)
+    p.add_argument("--partitions", type=int, default=s.kafka_partitions)
     p.add_argument(
         "--idle-timeout",
         type=float,
@@ -138,6 +145,7 @@ async def _main(argv=None) -> None:
         dsn=args.dsn,
         batch_size=args.batch_size,
         idle_timeout_s=args.idle_timeout,
+        partitions=args.partitions,
         stop=stop,
     )
 
