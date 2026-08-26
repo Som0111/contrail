@@ -130,3 +130,31 @@ def test_window_start_floors_to_the_boundary():
     assert window_start(T0 + timedelta(seconds=125), window_s=DEFAULT_WINDOW_S) == (
         T0 + timedelta(seconds=120)
     )
+
+
+def test_compare_counts_missing_phantom_and_mismatched_windows():
+    """The metric the 1.3 benchmark reports, checked against a hand-built case."""
+    from src.windowing.aggregates import compare
+
+    events = [
+        event(offset_s=10, arrival_s=10, altitude_m=1000.0, icao="fff001"),
+        event(offset_s=20, arrival_s=20, altitude_m=2000.0, icao="fff002"),
+        event(offset_s=50, arrival_s=90, altitude_m=9000.0, icao="fff003"),
+    ]
+    truth = ground_truth(events)
+    c = compare(truth, naive.aggregate(events))
+
+    # One real window with a wrong count, plus one window naive invented.
+    assert c.windows_total == 2
+    assert c.windows_wrong == 2
+    assert c.phantom == 1
+    assert c.missing == 0
+    assert c.count_mismatch == 1
+    assert c.worst_count_error == 1
+    assert c.window_error_rate == 1.0
+
+    # A processor that reproduces truth scores exactly zero.
+    perfect = compare(truth, truth)
+    assert perfect.windows_wrong == 0
+    assert perfect.window_error_rate == 0.0
+    assert perfect.worst_count_error == 0

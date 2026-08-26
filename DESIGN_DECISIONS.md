@@ -186,3 +186,33 @@ Concretely, what today's implementation does and does not support: **the 1.3 ben
 describe event-time attribution over a correctly-ordered replay. They do not demonstrate correct
 watermarking under live multi-partition consumption** — that claim is unavailable until
 per-partition watermarks exist, and the README must not imply otherwise.
+
+## 1.3 — The benchmark replays the seeded generator, not a Kafka topic
+Both processors are pure functions over a list of events in arrival order — exactly what `collect()`
+returns from a real topic — so the transport cannot change their output. Alternative: publish each
+configuration to Redpanda and consume it back, which is more end-to-end. Rejected because it adds
+broker scheduling and consumer-fetch variance to a measurement of *windowing correctness*, and every
+number would then depend on how the machine happened to schedule that run. The seeded generator makes
+each row reproducible from the config printed beside it, which is the property that matters for a
+benchmark someone else will re-run. The end-to-end Kafka path is exercised by the 1.2 live run and
+by Phase 1.6's replay harness, which is where transport actually is the thing under test.
+
+## 1.3 — Two disorder groups, because one number would have been a lie
+The generator has two disorder mechanisms of very different magnitude: bounded out-of-order arrival
+within `max_skew_s`, and late arrivals of 90-240s. The first draft swept them mixed together, and the
+watermark engine showed 85.69% window error at L = max skew — which reads as "the engine does not
+work". It was working exactly as designed: the residual error was entirely late-chaos events beyond
+any sane bound, correctly routed to the side output. Reporting that mixed number would have
+understated the engine on bounded disorder and overstated what a lateness bound can do about
+unbounded lateness. Splitting the sweep shows both truthfully: exactly 0.00% error under bounded
+disorder at L = max skew, and honest, *reported* degradation under unbounded lateness.
+
+## 1.3 — Three metrics, because each one alone misleads
+Window error rate is a sensitivity measure: at low disorder the baseline misplaces 0.22% of events
+but corrupts 22.05% of windows, since one stray event out of ~57 is enough to make a window's
+aggregate wrong. Event misattribution rate is the magnitude, but it flattens the worst case. So the
+benchmark reports window error rate, event misattribution rate, and the worst single window's count
+deviation — plus a fourth column, `silent`, which is the one that matters operationally. Every event
+the baseline misplaces is misplaced with no record; every event the watermark engine cannot place is
+in a counted side output. Under high disorder with late arrivals that is 16,487 silent errors against
+0. A single "accuracy" headline would have hidden the difference that actually matters in production.

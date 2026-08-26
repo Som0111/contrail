@@ -120,3 +120,66 @@ def ground_truth(
     for event in events:
         agg.add(window_start(event.event_time, window_s), event)
     return agg.finalize()
+
+
+@dataclass
+class Comparison:
+    """How far an aggregate output sits from ground truth.
+
+    Counted over the *union* of window keys, so a phantom window an engine
+    invented is an error just as much as a real window it lost. Normalising by
+    ground truth alone would let a processor hide invented windows for free.
+    """
+
+    windows_total: int = 0
+    windows_wrong: int = 0
+    missing: int = 0        # real window the processor never produced
+    phantom: int = 0        # window the processor invented
+    count_mismatch: int = 0
+    value_mismatch: int = 0  # averages beyond tolerance
+    abs_count_error: int = 0  # per-window count deviations, summed
+    worst_count_error: int = 0  # largest single-window count deviation
+
+    @property
+    def window_error_rate(self) -> float:
+        return self.windows_wrong / self.windows_total if self.windows_total else 0.0
+
+
+def compare(
+    truth: dict[WindowKey, WindowAggregate],
+    got: dict[WindowKey, WindowAggregate],
+    rel_tol: float = 1e-3,
+) -> Comparison:
+    c = Comparison(windows_total=len(set(truth) | set(got)))
+    for key in set(truth) | set(got):
+        t, g = truth.get(key), got.get(key)
+        if g is None:
+            c.missing += 1
+            c.windows_wrong += 1
+            c.abs_count_error += t.count
+            c.worst_count_error = max(c.worst_count_error, t.count)
+            continue
+        if t is None:
+            c.phantom += 1
+            c.windows_wrong += 1
+            c.abs_count_error += g.count
+            c.worst_count_error = max(c.worst_count_error, g.count)
+            continue
+        wrong = False
+        if t.count != g.count:
+            c.count_mismatch += 1
+            c.abs_count_error += abs(t.count - g.count)
+            c.worst_count_error = max(c.worst_count_error, abs(t.count - g.count))
+            wrong = True
+        if not (
+            _close(t.avg_altitude_m, g.avg_altitude_m, rel_tol)
+            and _close(t.avg_velocity_ms, g.avg_velocity_ms, rel_tol)
+        ):
+            c.value_mismatch += 1
+            wrong = True
+        c.windows_wrong += wrong
+    return c
+
+
+def _close(a: float, b: float, rel_tol: float) -> bool:
+    return abs(a - b) <= rel_tol * max(abs(a), abs(b), 1.0)
