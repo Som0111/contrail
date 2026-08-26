@@ -75,11 +75,21 @@ async def collect(
     idle_timeout_s: float = 10.0,
     poll_timeout_ms: int = 1000,
 ) -> list[FlightState]:
-    """Read a topic into memory in arrival order, for offline windowing runs.
+    """Read a topic into memory in recorded arrival order, for offline windowing runs.
 
     Deliberately not the sink's consume loop: this one commits nothing and keeps
     everything in memory, because the windowing processors are compared over a
     fixed, replayable batch rather than run as a live service.
+
+    The sort at the end is load-bearing, not tidiness. `getmany()` hands back
+    per-partition batches, so concatenating them interleaves six partitions in
+    arbitrary chunks -- a chunk from one partition carries event_times from late
+    in the run, which would drag a single global watermark forward and prematurely
+    finalize windows the other partitions have not delivered yet. `ingest_time` is
+    the arrival instant the recording captured, so sorting on it restores the
+    stream the way it actually arrived. See DESIGN_DECISIONS.md 1.2 -- a *live*
+    multi-partition consumer needs per-partition watermarks instead, since it
+    cannot sort a stream it has not finished reading.
     """
     await ensure_topic(bootstrap, topic, get_settings().kafka_partitions)
     consumer = AIOKafkaConsumer(
@@ -108,5 +118,6 @@ async def collect(
             events.extend(FlightState.model_validate_json(r.value) for r in records)
     finally:
         await consumer.stop()
+    events.sort(key=lambda e: e.ingest_time)
     log.info("collected %d events from %s", len(events), topic)
     return events

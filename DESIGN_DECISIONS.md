@@ -129,3 +129,45 @@ identical stream. And it is strictly *more* wrong: consume-time adds queueing de
 arrival delay, so it would misattribute more events, not fewer. Using `ingest_time` therefore
 handicaps the comparison in the baseline's favour, which is the safe direction for a claim we intend
 to defend.
+
+## 1.2 — Watermark = max observed event_time minus a fixed allowed-lateness bound
+The classic bounded-disorder heuristic, and the reason the engine is immune to the failure that
+breaks the naive baseline: the watermark advances on *event time only*, so a delayed event cannot
+close its own window. Alternatives considered: a processing-time-driven watermark (wall clock minus
+a bound), which reintroduces exactly the arrival-time dependence we are trying to eliminate — a slow
+consumer would start finalizing windows early; and a percentile-based adaptive watermark that learns
+the observed skew distribution, which is genuinely better under variable disorder but is unfalsifiable
+in a benchmark, since the bound would move while being measured. A fixed configurable bound gives a
+guarantee that can be stated and tested as an equality:
+
+    allowed_lateness >= max arrival skew  =>  output is identical to ground truth
+
+`test_lateness_bound_at_or_above_max_skew_gives_exact_output` asserts that equality directly, and
+`test_error_appears_only_once_disorder_exceeds_the_bound` asserts the degradation is monotone as the
+bound tightens. That relationship is what makes the 1.3 sanity check meaningful rather than a vibe.
+
+## 1.2 — Late events go to a counted side output, never to /dev/null
+An event whose window has already been finalized is appended to a side-output list and logged at
+WARNING with its window, the watermark that closed it, and how late it was. Alternative: drop it
+(what most naive implementations do), or reopen the window and re-emit a correction. Dropping is
+unacceptable because it makes data loss invisible — the aggregate is simply quietly wrong. Window
+re-opening was rejected as out of scope: it means retracting an already-published aggregate, which
+needs downstream consumers that understand retractions, and nothing in this project has one yet.
+The accounting identity is tested: `windowed + late == processed`, so every arrived event is either
+in a window or in the side output, and never in neither.
+
+## 1.2 — `collect()` restores recorded arrival order; a live consumer would need per-partition watermarks
+Found by running the engine against the real topic rather than trusting the unit tests: the L=30s
+run reported 6,816 late events where ~200 were expected. Cause: `getmany()` returns per-partition
+record batches, and concatenating them interleaves six partitions in arbitrary chunks, so a chunk
+from one partition carries event_times from late in the run. Those drag a single global watermark
+forward and prematurely finalize windows the other partitions have not delivered yet — every
+subsequent record from those partitions is then, correctly by the engine's own logic, reported late.
+The engine was right; the input was not the stream it claimed to be. Fix: `collect()` sorts on
+`ingest_time`, which is the arrival instant the recording captured, so offline replay sees the stream
+as it actually arrived. An integration test now asserts that ordering, since the failure was silent.
+The alternative — per-partition watermarks with the global watermark taken as the minimum across
+partitions, which is what Flink and Beam do — is the right answer for a *live* multi-partition
+consumer, because it cannot sort a stream it has not finished reading. That is deferred to the live
+windowing service in Phase 2 and noted here rather than being pre-built now; it also carries the
+idle-partition problem (a silent partition stalls the global watermark), which needs its own handling.

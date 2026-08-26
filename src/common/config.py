@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     chaos_late_delay_s: float = 90.0
     chaos_drop_prob: float = 0.0
 
+    # Windowing (Phase 1). allowed_lateness is swept in the 1.3 benchmark.
+    window_s: int = 60
+    allowed_lateness_s: float = 30.0
+
     postgres_host: str = "timescaledb"
     postgres_port: int = 5432
     postgres_db: str = "contrail"

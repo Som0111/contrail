@@ -164,3 +164,26 @@ async def test_trace_id_is_stable_across_runs():
     dup_key = next(k for k, c in by_key.items() if c > 1)
     dup_ids = {timescale.trace_id(e) for e in events if e.dedup_key == dup_key}
     assert len(dup_ids) == 1
+
+
+async def test_collect_returns_events_in_recorded_arrival_order():
+    """Regression: `getmany()` hands back per-partition batches.
+
+    Concatenating them interleaves partitions in arbitrary chunks, which silently
+    wrecks any single global watermark downstream -- it was reporting 33x too many
+    late events before `collect()` restored arrival order.
+    """
+    from src.ingestor.base import collect
+
+    events = make_events(n_aircraft=30, ticks=60)
+    topic = f"test.order.{uuid.uuid4().hex[:8]}"
+    await produce(topic, events, partitions=6)
+
+    got = await collect(
+        SETTINGS.kafka_bootstrap, topic, f"g-order-{uuid.uuid4().hex[:8]}",
+        duration_s=30.0, idle_timeout_s=2.0,
+    )
+    assert len(got) == len(events)
+    arrivals = [e.ingest_time for e in got]
+    assert arrivals == sorted(arrivals), "collect() must restore recorded arrival order"
+    assert {e.dedup_key for e in got} == {e.dedup_key for e in events}

@@ -52,30 +52,58 @@ class Aggregator:
         self._sums: dict[WindowKey, _Sums] = {}
         self._seen: set[tuple[str, datetime]] = set()
 
-    def add(self, window: datetime, event: FlightState) -> bool:
-        """Returns False if this event was already counted (in any window)."""
+    def seen_before(self, event: FlightState) -> bool:
+        """Check *and* mark. True means this event has already been counted.
+
+        Split out from `add()` so the watermark engine can settle
+        duplicate-or-not before it decides late-or-not -- a duplicate of a late
+        event should be dropped as a duplicate, not reported twice in the side
+        output.
+        """
+        # ponytail: unbounded seen-set, one entry per unique event. Fine for the
+        # bounded replay runs the benchmarks use; bound it by the watermark if
+        # this ever runs as a long-lived service.
         if event.dedup_key in self._seen:
-            return False
+            return True
         self._seen.add(event.dedup_key)
+        return False
+
+    def accumulate(self, window: datetime, event: FlightState) -> None:
+        """Fold an event in without a duplicate check."""
         s = self._sums.setdefault((window, event.partition_key), _Sums())
         s.count += 1
         s.altitude_m += event.altitude_m
         s.velocity_ms += event.velocity_ms
+
+    def add(self, window: datetime, event: FlightState) -> bool:
+        """Returns False if this event was already counted (in any window)."""
+        if self.seen_before(event):
+            return False
+        self.accumulate(window, event)
         return True
 
+    def pop_window(self, window: datetime) -> dict[WindowKey, WindowAggregate]:
+        """Finalize and evict every geo-cell bucket belonging to one window."""
+        keys = [k for k in self._sums if k[0] == window]
+        return {k: _build(k, self._sums.pop(k)) for k in keys}
+
+    def pending_windows(self) -> set[datetime]:
+        return {k[0] for k in self._sums}
+
     def finalize(self) -> dict[WindowKey, WindowAggregate]:
-        return {
-            key: WindowAggregate(
-                window_start=key[0],
-                partition_key=key[1],
-                count=s.count,
-                # Rounded so two runs that sum in a different order still compare
-                # equal; float addition is not associative.
-                avg_altitude_m=round(s.altitude_m / s.count, 4),
-                avg_velocity_ms=round(s.velocity_ms / s.count, 4),
-            )
-            for key, s in self._sums.items()
-        }
+        return {key: _build(key, s) for key, s in self._sums.items()}
+
+
+def _build(key: WindowKey, s: _Sums) -> WindowAggregate:
+    return WindowAggregate(
+        window_start=key[0],
+        partition_key=key[1],
+        count=s.count,
+        # Rounded so two runs that sum in a different order still compare equal;
+        # float addition is not associative.
+        avg_altitude_m=round(s.altitude_m / s.count, 4),
+        avg_velocity_ms=round(s.velocity_ms / s.count, 4),
+    )
 
 
 def ground_truth(

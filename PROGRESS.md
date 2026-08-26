@@ -122,3 +122,43 @@ late arrivals), and 164 of 167 real windows (98.2%) disagreed on count.
 Deviations: None.
 Known issues: None. The 98.2% figure is a single ad-hoc run and is NOT the headline number — 1.3
 produces the real measurement by sweeping disorder levels over a replayed stream.
+
+## [Phase 1.2] — 2026-08-27
+Built: `windowing/watermark.py` — `WatermarkProcessor` streaming event-time windowing with
+`watermark = max(event_time seen) - allowed_lateness`, windows finalized once the watermark passes
+their end, a counted+logged `LateEvent` side output for events arriving after finalization, and
+end-of-stream `close()` that finalizes whatever is still open. Allowed lateness and window size are
+config fields with CLI overrides. Extended `Aggregator` with `seen_before()` / `accumulate()` /
+`pop_window()` so dedup stays byte-identical to the naive baseline and windows can be evicted as
+they finalize.
+Verified: 32 tests pass (9 new unit, 1 new integration), `ruff check src tests scripts` clean.
+Same controlled sequence as 1.1 (three events in window A, one delayed from 00:50 to arrival at
+01:30): watermark reproduces ground truth exactly — all 3 in window A, avg altitude 4000 m, no
+phantom window B — while naive on the identical input still puts 2 in A at 1500 m. Asserted as an
+equality against `ground_truth()`, not eyeballed. Side output: non-empty exactly when it should be
+(a straggler delivered after its window was finalized is reported once, with window and watermark,
+and does not corrupt the closed window), empty when the lateness allowance still covers the delay.
+Proved the guarantee `allowed_lateness >= max_skew => output == ground truth` on generated disorder
+(ooo 0.4, skew 20s), and that degradation is monotone as the bound tightens. Accounting identity
+`windowed + late == processed` holds. Live run over the recorded 14,960-event topic: at
+allowed-lateness 200s, 0 late events and 0 of 167 windows disagreeing with ground truth; at 30s,
+205 late events and 73 of 167 windows differing — the late-arrival chaos (90-180s) exceeding the
+bound, as designed.
+Deviations: None to the plan, but a real bug was found and fixed rather than worked around — see
+below.
+Known issues: The live windowing path in Phase 2 will need per-partition watermarks (global
+watermark = min across partitions), because a live consumer cannot sort a stream it has not finished
+reading. Documented in DESIGN_DECISIONS.md 1.2 along with the idle-partition problem that approach
+brings. Not pre-built here.
+
+### Bug found during 1.2 (worth an interview story)
+Against the real topic the engine reported 6,816 late events at a 30s bound where ~200 were
+expected — 33x too many. The engine was correct; the input was not the stream it claimed to be.
+`AIOKafkaConsumer.getmany()` returns per-partition batches, and concatenating them interleaves six
+partitions in arbitrary chunks, so a chunk from one partition carries event_times from late in the
+run. Those drag a single global watermark forward and prematurely finalize windows the other
+partitions have not yet delivered, after which every record from those partitions is legitimately
+late by the engine's own rule. Fixed by sorting `collect()` output on `ingest_time` (the recorded
+arrival instant), which drops it to 205. An integration test now asserts the ordering, because the
+failure mode was completely silent — the unit tests all passed throughout, since they feed
+`simulate()` output which is already in true arrival order.
