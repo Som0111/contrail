@@ -87,9 +87,14 @@ async def collect(
     in the run, which would drag a single global watermark forward and prematurely
     finalize windows the other partitions have not delivered yet. `ingest_time` is
     the arrival instant the recording captured, so sorting on it restores the
-    stream the way it actually arrived. See DESIGN_DECISIONS.md 1.2 -- a *live*
-    multi-partition consumer needs per-partition watermarks instead, since it
-    cannot sort a stream it has not finished reading.
+    stream the way it actually arrived.
+
+    OFFLINE REPLAY ONLY. This is correct here solely because the topic is bounded
+    and already recorded, so every record can be seen before the order is decided.
+    Do not reuse this for live ingestion: a live consumer cannot sort a stream it
+    has not finished reading, and has nowhere to buffer an unbounded one. The live
+    path needs per-partition watermarks with the global watermark taken as the
+    minimum across partitions. See DESIGN_DECISIONS.md 1.2.
     """
     await ensure_topic(bootstrap, topic, get_settings().kafka_partitions)
     consumer = AIOKafkaConsumer(

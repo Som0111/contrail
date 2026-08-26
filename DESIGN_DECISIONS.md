@@ -166,8 +166,23 @@ subsequent record from those partitions is then, correctly by the engine's own l
 The engine was right; the input was not the stream it claimed to be. Fix: `collect()` sorts on
 `ingest_time`, which is the arrival instant the recording captured, so offline replay sees the stream
 as it actually arrived. An integration test now asserts that ordering, since the failure was silent.
-The alternative — per-partition watermarks with the global watermark taken as the minimum across
-partitions, which is what Flink and Beam do — is the right answer for a *live* multi-partition
-consumer, because it cannot sort a stream it has not finished reading. That is deferred to the live
-windowing service in Phase 2 and noted here rather than being pre-built now; it also carries the
-idle-partition problem (a silent partition stalls the global watermark), which needs its own handling.
+**Scope limit, stated plainly: the sort is valid for offline replay only, and must not be carried
+into live ingestion.** It works here because `collect()` reads a bounded, already-recorded topic
+into memory and can therefore see every record before deciding the order. Neither condition holds
+for a live consumer: it cannot sort a stream it has not finished reading, and it has nowhere to
+buffer an unbounded one. Reusing this approach live would mean holding records back until "enough"
+have arrived — which is an allowed-lateness bound implemented badly, in the wrong layer, with
+unbounded memory.
+
+The real fix for live multi-partition ingestion is a per-partition watermark, with the global
+watermark taken as the *minimum* across partitions — what Flink and Beam do. Each partition's
+watermark advances only on the event_times that partition itself delivers, so a partition running
+ahead can no longer finalize windows on another's behalf, which is exactly the failure above. It is
+deferred to the live windowing service in Phase 2 rather than pre-built now, and it brings its own
+problem: a partition that goes idle stops advancing its watermark and stalls the global minimum
+indefinitely, so it needs an idleness timeout that drops a quiet partition out of the minimum.
+
+Concretely, what today's implementation does and does not support: **the 1.3 benchmark numbers
+describe event-time attribution over a correctly-ordered replay. They do not demonstrate correct
+watermarking under live multi-partition consumption** — that claim is unavailable until
+per-partition watermarks exist, and the README must not imply otherwise.
