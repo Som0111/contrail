@@ -100,3 +100,25 @@ topic-vs-table reconciliation, which is unambiguous.
 - [x] `phase0_report.py` output is internally consistent (stored + suppressed == received, and all
       four chaos rates recoverable from the output)
 - [x] `DESIGN_DECISIONS.md` has entries for partitioning scheme (0.2) and idempotency key (0.3)
+
+## [Phase 1.1] — 2026-08-27
+Built: `windowing/aggregates.py` — shared `WindowAggregate` shape, `window_start()` flooring,
+an `Aggregator` that deduplicates on `(icao24, event_time)` as it folds, and `ground_truth()`
+(attribution by `event_time` over arrived events). `windowing/naive.py` — the deliberate baseline,
+tumbling windows keyed on arrival time, aggregating count / avg altitude / avg velocity per
+(window, geo cell), with a CLI that prints both its own output and ground truth side by side.
+Added `collect()` to `ingestor/base.py` to read a topic into memory in arrival order.
+Verified: 22 tests pass (7 new), `ruff check src tests scripts` clean. Controlled hand-built
+sequence: three events all belonging to window A, one delayed from 00:50 to arrival at 01:30 —
+ground truth puts all 3 in window A (avg altitude 4000 m); naive puts 2 in window A (avg altitude
+1500 m, off by exactly 2500 m) and invents a window B holding the stolen event. Asserted directly,
+not eyeballed. Also asserted: naive is *exactly* equal to ground truth when nothing is delayed
+(the baseline is fragile, not broken — this is the sanity check on the harness itself), duplicates
+are counted once on both sides, disorder conserves the total event count (naive misfiles, it does
+not lose), and late arrivals push naive past the end of the real event span. Live run: generator
+180s at 40 aircraft x 2 Hz, chaos ooo 0.20 / max-skew 20s / dup 0.05 / late 0.03 at 90s / drop 0.01
+-> 14,960 events consumed, naive produced 259 windows against ground truth's 167 (92 invented by
+late arrivals), and 164 of 167 real windows (98.2%) disagreed on count.
+Deviations: None.
+Known issues: None. The 98.2% figure is a single ad-hoc run and is NOT the headline number — 1.3
+produces the real measurement by sweeping disorder levels over a replayed stream.

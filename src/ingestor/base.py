@@ -5,13 +5,15 @@ this, so `publish()` and the whole downstream pipeline never learn which one is
 running.
 """
 
+import asyncio
 import logging
 from typing import AsyncIterator, Protocol, runtime_checkable
 
-from aiokafka import AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
 
+from src.common.config import get_settings
 from src.common.models import FlightState
 
 log = logging.getLogger("contrail.ingestor")
@@ -63,3 +65,48 @@ async def publish(
         await producer.stop()
         log.info("published %d events from source=%s", published, source.name)
     return published
+
+
+async def collect(
+    bootstrap: str,
+    topic: str,
+    group: str,
+    duration_s: float,
+    idle_timeout_s: float = 10.0,
+    poll_timeout_ms: int = 1000,
+) -> list[FlightState]:
+    """Read a topic into memory in arrival order, for offline windowing runs.
+
+    Deliberately not the sink's consume loop: this one commits nothing and keeps
+    everything in memory, because the windowing processors are compared over a
+    fixed, replayable batch rather than run as a live service.
+    """
+    await ensure_topic(bootstrap, topic, get_settings().kafka_partitions)
+    consumer = AIOKafkaConsumer(
+        topic,
+        bootstrap_servers=bootstrap,
+        group_id=group,
+        enable_auto_commit=False,
+        auto_offset_reset="earliest",
+    )
+    await consumer.start()
+    events: list[FlightState] = []
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + duration_s
+    idle_for = 0.0
+    try:
+        while loop.time() < deadline:
+            batches = await consumer.getmany(timeout_ms=poll_timeout_ms)
+            records = [r for rs in batches.values() for r in rs]
+            if not records:
+                idle_for += poll_timeout_ms / 1000.0
+                if idle_for >= idle_timeout_s:
+                    log.info("idle, stopping collect", extra={"collected": len(events)})
+                    break
+                continue
+            idle_for = 0.0
+            events.extend(FlightState.model_validate_json(r.value) for r in records)
+    finally:
+        await consumer.stop()
+    log.info("collected %d events from %s", len(events), topic)
+    return events

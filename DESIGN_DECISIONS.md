@@ -103,3 +103,29 @@ auto-creation, or document a required start order. Rejected both: a documented o
 is a trap that fires under Compose restarts, and disabling auto-create turns the mistake into a
 crash somewhere less obvious. Instead the sink calls the same idempotent `ensure_topic()` the
 producer does, so whichever starts first creates the topic with the configured partition count.
+
+## 1.1 — Deduplication is shared by both processors, not left to each
+`Aggregator.add()` drops repeat `(icao24, event_time)` keys, so the naive baseline and the Phase 1.2
+watermark engine both see each event exactly once. Alternative: let the naive processor double-count
+duplicates, since a truly naive implementation would. Rejected because it would inflate naive's
+measured error with a second, unrelated fault, and core claim #1 is specifically about event-time
+attribution. Keeping dedup identical on both sides means every difference the 1.3 benchmark reports
+is attribution error and nothing else — a smaller, but honest, number.
+
+## 1.1 — Ground truth is defined over arrived events, not generated ones
+`ground_truth()` attributes by `event_time` over the events that actually reached the processor.
+Alternative: compare against everything the generator emitted, including dropped events. Rejected
+because no processor can attribute a record it never received — counting the drop rate against both
+of them would add a constant error to each and measure the network, not the windowing. Drops stay
+visible as a separate configured rate, verified independently in Phase 0.
+
+## 1.1 — The naive baseline uses recorded `ingest_time`, not wall-clock-at-consume
+A textbook processing-time window keys on `now()` at the moment the consumer handles the record.
+This one keys on the `ingest_time` stamped when the record entered the pipeline. Alternative: call
+`now()` in the consume loop, which is more literally "processing time". Rejected for two reasons.
+It would make the baseline non-reproducible — the same recorded stream would bucket differently
+depending on how fast the machine drained the topic, and 1.3 has to re-run both processors over an
+identical stream. And it is strictly *more* wrong: consume-time adds queueing delay on top of
+arrival delay, so it would misattribute more events, not fewer. Using `ingest_time` therefore
+handicaps the comparison in the baseline's favour, which is the safe direction for a claim we intend
+to defend.
