@@ -91,7 +91,15 @@ async def run(
                 # ponytail: per-worker throughput ceiling so worker count is the
                 # real capacity knob; without it one batched writer out-runs any
                 # generator this machine can produce and scaling proves nothing.
-                await asyncio.sleep(len(consumed) / max_rate)
+                #
+                # Charged on `events`, not `consumed`: the ceiling stands in for
+                # per-worker *write* capacity, and a shed record is never written.
+                # Billing for discarded records made shedding structurally unable
+                # to buy back any throughput, so it could relieve lag only by
+                # coincidence -- which is exactly how it behaved before this was
+                # fixed. Deserialising and filtering a record is not free, but it
+                # is far cheaper than the insert this models.
+                await asyncio.sleep(len(events) / max_rate)
             inserted = await timescale.insert_events(pool, events) if events else 0
             # Shed records are committed too: they were consumed and deliberately
             # discarded, so replaying them would undo the shedding decision.
