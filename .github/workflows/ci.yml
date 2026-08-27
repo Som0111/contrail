@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check src tests scripts load
+
+      # Unit tests only. The integration suite needs live Redpanda, TimescaleDB,
+      # Redis and the API, and the benchmarks need minutes of sustained load --
+      # neither belongs in a per-push check for a project this size. They run
+      # locally via `docker compose run --rm tests pytest -q`.
+      - name: Unit tests
+        run: pytest tests/unit -q
