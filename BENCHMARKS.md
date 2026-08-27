@@ -277,3 +277,80 @@ is no partial state to reconcile and no checkpoint to repair -- the restarted re
 offset 0 and lands on the same digest. Combined with the Phase 0.3 result (the *sink* survives
 `SIGKILL` with zero duplicate rows, via the database idempotency key), the pipeline is
 crash-safe at both ends: writes are idempotent, and reads are reproducible.
+
+---
+
+# API load test (Locust)
+
+**Reproduce:**
+```
+RATE_LIMIT_RPS=100000 RATE_LIMIT_BURST=100000 docker compose up -d api
+docker compose run --rm --no-deps tests \
+  locust -f /app/load/locustfile.py --headless -u 100 -r 20 -t 120s --host http://api:8000
+docker compose up -d api        # restore the default 10 rps limit
+```
+
+## Configuration
+
+| | |
+|---|---|
+| load profile | 4:1 mix of REST pollers to WebSocket subscribers; REST tasks weighted 6:2:1 across `/api/windows`, `/api/status`, `/healthz` |
+| think time | 0.5-2.0s between REST tasks |
+| rate limiting | raised to effectively unlimited for the run — the limiter is **per client IP** and a load generator is one IP, so at the default 10 rps this would measure the limiter, not the API. 429s are counted, not hidden, so a misconfigured run is visible in the results. |
+| environment | everything co-resident on one 2-core i7-5500U: API, generator, adaptive pipeline, windowing service, Redpanda, TimescaleDB, Redis, Prometheus, Grafana, **and Locust itself** |
+
+## Results
+
+| | 20 users, 60s | 100 users, 120s |
+|---|---|---|
+| requests | 860 | 4,296 |
+| throughput | 14.3 req/s | **36.9 req/s** |
+| failures | 0 | 4 (0.09%) — WebSocket connect timeouts during ramp |
+| `/api/windows` p50 | **25 ms** | 1,000 ms |
+| `/api/windows` p95 | **200 ms** | 3,400 ms |
+| `/api/windows` p99 | 320 ms | 7,000 ms |
+| `/api/status` p95 | 400 ms | 5,800 ms |
+| aggregate p95 | **240 ms** | 3,700 ms |
+| WebSocket windows delivered | — | 574 (4.93/s), p95 2 ms |
+
+**The 100-user column is a saturation datapoint, not the API's capability.** With ten containers and
+the load generator sharing two cores, that run is CPU-bound on the host — `docker stats` showed the
+API alone at ~62% CPU with TimescaleDB, Redpanda and the pipeline competing for what was left. The
+20-user column, where the box is not starved, is the honest measure of the API's own latency:
+**p50 25 ms and p95 200 ms** to read aggregates out of Redis. Neither figure is a claim about
+capacity on real hardware; both were measured here and are reported as measured.
+
+WebSocket delivery is essentially free once connected — p95 of 2 ms to hand a finalized window to a
+subscriber, because the API is only relaying a Redis pub/sub message it already holds.
+
+## The finding: connection-per-request
+
+The first run of this test produced **p95 4,900 ms on `/api/windows`, 9,300 ms on `/api/status`, and
+35.65% of `/healthz` requests returning 503** — with an aggregate failure rate of 2.64%. The API had
+not crashed; it was opening a fresh Redis connection on every request and a fresh Postgres
+connection on every `/api/status`, so 100 concurrent users meant 100 concurrent connection
+handshakes. `/healthz` was worst hit, because each probe opened connections to all three
+dependencies and its 3s probe timeout then expired under the contention it had created.
+
+Fixed by moving to a process-wide Redis client, an asyncpg pool and a single Kafka admin client,
+created once in a FastAPI lifespan handler. Same test, same machine, immediately after:
+
+| | before pooling | after pooling |
+|---|---|---|
+| aggregate failures | 2.64% | **0.09%** |
+| `/healthz` 503s | **82 (35.65%)** | **0** |
+| throughput | 27.6 req/s | **36.9 req/s** |
+| `/api/windows` p50 / p95 | 2,300 / 4,900 ms | **1,000 / 3,400 ms** |
+| `/api/status` p95 | 9,300 ms | 5,800 ms |
+| aggregate p95 | 5,400 ms | 3,700 ms |
+
+This is the whole reason the load test is worth running: nothing in the unit or integration suite
+exercises concurrency, so a connection-per-request API passes every correctness test and only
+reveals itself under load.
+
+## Known limitation
+
+Four of roughly twenty WebSocket connections time out during the 100-user ramp (5s client timeout,
+20 users/second arriving). It is a ramp-rate artefact on a saturated host rather than a steady-state
+failure — no connection dropped once established, and the 20-user run had zero connect failures.
+Not chased further, and recorded here rather than smoothed away by raising the client timeout.

@@ -30,7 +30,33 @@ settings = get_settings()
 configure(settings.log_level)
 log = logging.getLogger("contrail.api")
 
-app = FastAPI(title="Contrail", version="0.2.0")
+@contextlib.asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """One Redis client, one Postgres pool, one Kafka admin client for the process.
+
+    The first load test opened a fresh connection to every dependency on every
+    request: p95 was 4.9s on /api/windows and a third of /healthz probes returned
+    503, because 100 concurrent users meant 100 concurrent TCP handshakes and TLS-
+    free-but-still-expensive Postgres startups. None of that was the API doing
+    work -- it was the API establishing connections it should have already had.
+    """
+    conns["redis"] = aioredis.from_url(
+        settings.redis_url, decode_responses=True, max_connections=64
+    )
+    conns["pg"] = await asyncpg.create_pool(settings.postgres_dsn, min_size=2, max_size=16)
+    admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap)
+    await admin.start()
+    conns["kafka"] = admin
+    try:
+        yield
+    finally:
+        await conns["kafka"].close()
+        await conns["pg"].close()
+        await conns["redis"].aclose()
+
+
+conns: dict = {}
+app = FastAPI(title="Contrail", version="0.2.0", lifespan=lifespan)
 limiter = RateLimiter(settings.rate_limit_rps, settings.rate_limit_burst)
 
 PROBE_TIMEOUT = 3.0
@@ -47,7 +73,8 @@ _health_lock = asyncio.Lock()
 # --------------------------------------------------------------------------- infra
 
 def redis_client() -> aioredis.Redis:
-    return aioredis.from_url(settings.redis_url, decode_responses=True)
+    """The shared client. Callers must NOT close it -- it outlives the request."""
+    return conns["redis"]
 
 
 @app.get("/metrics")
@@ -86,32 +113,20 @@ async def rate_limit(request: Request, call_next):
 # --------------------------------------------------------------------------- health
 
 async def _check_redpanda() -> None:
-    admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap)
-    await admin.start()
-    try:
-        await admin.list_topics()
-    finally:
-        await admin.close()
+    await conns["kafka"].list_topics()
 
 
 async def _check_timescale() -> None:
-    conn = await asyncpg.connect(settings.postgres_dsn)
-    try:
+    async with conns["pg"].acquire() as conn:
         version = await conn.fetchval(
             "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
         )
-        if version is None:
-            raise RuntimeError("timescaledb extension not installed")
-    finally:
-        await conn.close()
+    if version is None:
+        raise RuntimeError("timescaledb extension not installed")
 
 
 async def _check_redis() -> None:
-    client = redis_client()
-    try:
-        await client.ping()
-    finally:
-        await client.aclose()
+    await conns["redis"].ping()
 
 
 CHECKS = {
@@ -169,11 +184,7 @@ async def windows(
     _: str = Depends(require_auth),
 ) -> JSONResponse:
     """Latest finalized window aggregate per geographic cell."""
-    client = redis_client()
-    try:
-        raw = await client.hgetall(CURRENT_KEY)
-    finally:
-        await client.aclose()
+    raw = await conns["redis"].hgetall(CURRENT_KEY)
     items = [json.loads(v) for k, v in sorted(raw.items()) if cell is None or k == cell]
     return JSONResponse({"count": len(items), "windows": items})
 
@@ -181,16 +192,11 @@ async def windows(
 @app.get("/api/status")
 async def api_status(_: str = Depends(require_auth)) -> JSONResponse:
     """Pipeline state: rows stored, cells with a finalized window, late total."""
-    client = redis_client()
-    conn = await asyncpg.connect(settings.postgres_dsn)
-    try:
+    async with conns["pg"].acquire() as conn:
         stored = await conn.fetchval("SELECT count(*) FROM flight_events")
         latest = await conn.fetchval("SELECT max(event_time) FROM flight_events")
-        cells = await client.hlen(CURRENT_KEY)
-        late = await client.get("contrail:windows:late_total")
-    finally:
-        await conn.close()
-        await client.aclose()
+    cells = await conns["redis"].hlen(CURRENT_KEY)
+    late = await conns["redis"].get("contrail:windows:late_total")
     return JSONResponse({
         "events_stored": stored,
         "latest_event_time": latest.isoformat() if latest else None,
@@ -219,8 +225,9 @@ async def ws_windows(websocket: WebSocket, token: str = Query(...)) -> None:
 
     await websocket.accept()
     metrics.WS_CLIENTS.inc()
-    client = redis_client()
-    pubsub = client.pubsub()
+    # pubsub() takes its own connection from the shared pool; the client itself
+    # is process-wide and must not be closed when this socket ends.
+    pubsub = conns["redis"].pubsub()
     await pubsub.subscribe(CHANNEL)
     log.info("ws client subscribed", extra={"channel": CHANNEL})
     try:
@@ -241,4 +248,3 @@ async def ws_windows(websocket: WebSocket, token: str = Query(...)) -> None:
         with contextlib.suppress(Exception):
             await pubsub.unsubscribe(CHANNEL)
             await pubsub.aclose()
-        await client.aclose()

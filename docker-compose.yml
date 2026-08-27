@@ -60,6 +60,8 @@ services:
       KAFKA_BOOTSTRAP: redpanda:29092
       POSTGRES_HOST: timescaledb
       REDIS_URL: redis://redis:6379/0
+      RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-10}
+      RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-20}
     ports:
       - "8000:8000"
     depends_on:
@@ -150,6 +152,7 @@ services:
       - ./src:/app/src
       - ./tests:/app/tests
       - ./scripts:/app/scripts
+      - ./load:/app/load
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       POSTGRES_HOST: timescaledb
