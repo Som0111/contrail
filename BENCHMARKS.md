@@ -146,6 +146,133 @@ HEADLINE  (watermark at L = max skew, the operationally sane setting)
   completed in 70.9s
 ```
 
-## Still to fill in
+---
 
-Phase 1.5 (control loop) and 1.6 (deterministic replay).
+# Claim #2 — Adaptive lag control vs a static worker pool
+
+**Reproduce:** `docker compose run --rm --no-deps api python -m scripts.benchmark_control`
+
+## Configuration
+
+| | |
+|---|---|
+| load | 60 aircraft; 120 ev/s for 30s -> **720 ev/s (6x) for 70s** -> 120 ev/s for 40s -> 60s drain |
+| per-worker cap | 250 ev/s (`--max-rate`), so worker count is the binding constraint |
+| static arm | pinned at 1 worker; the controller still runs and logs, but nothing it decides is applied |
+| adaptive arm | 1-4 workers, 2s sample interval, 6s cooldown |
+| latency | `processed_at - event_time` read back from TimescaleDB: aircraft state -> row durably committed |
+| chaos | off — injected arrival skew adds a constant to both arms and dilutes the queueing delay under test |
+| isolation | each arm gets a fresh topic and consumer group, never a recreated one |
+| seed / runtime | 20260827 / 403s total |
+
+Both arms run identical load, identical caps and identical lag sampling. The only difference is
+whether the controller's decisions are applied, so the gap below is adaptation, not instrumentation.
+
+## Results
+
+| | static (1 worker) | adaptive (1-4) | |
+|---|---|---|---|
+| events absorbed | 44,640 / 58,800 (**75.9%**) | 58,800 / 58,800 (**100%**) | |
+| peak lag | 33,480 | **10,780** | 3.1x lower |
+| final lag | **14,660 — never recovered** | **0** | fully drained |
+| p50 latency | 51.56s | **9.74s** | 5.3x lower |
+| p95 latency | 112.80s | **17.71s** | 6.4x lower |
+| p99 latency | 115.50s | **21.96s** | 5.3x lower |
+| max latency | 116.76s | **27.79s** | 4.2x lower |
+
+The headline is not really the percentile ratio. It is that **the static arm never recovers**: 60
+seconds after the burst ended it was still 14,660 events behind and had dropped 24% of the load on
+the floor, while the adaptive arm was fully drained at zero. The latency figures understate the
+difference, because the static arm's worst events are the ones it never processed at all and so are
+absent from its own percentiles.
+
+## Controller actions during the burst
+
+```
+scale_up    lag=  4,200 slope= +428.7/s t=18.90 -> workers=2
+scale_up    lag=  7,520 slope= +533.2/s t=30.54 -> workers=3
+scale_up    lag=  9,400 slope= +394.7/s t=10.44 -> workers=4
+scale_down  lag=      6 slope= -281.1/s t=10.53 -> workers=3
+scale_down  lag=      0 slope=  -69.2/s t= 2.96 -> workers=2
+scale_down  lag=     60 slope=  +1.7/s  t= 0.60 -> workers=1
+```
+
+Three scale-ups during the ramp, then the pool is held at 4 for the whole drain and released only
+once the backlog is essentially gone.
+
+## What this run does NOT show
+
+**Load shedding never triggered here, so this benchmark measures the scaling half of claim #2 only.**
+Four workers at 250 ev/s each is 1,000 ev/s against a 720 ev/s burst, so scaling absorbed the load
+completely and the shed path was correctly never reached. Shedding is exercised in the Phase 1.4
+integration run (at max workers with lag still growing 248/s for 3 consecutive samples: 1,816 events
+dropped across 12 named geographic cells, released once lag drained at -207/s), and can be forced
+here with `--max-workers 2`. That variant has not been run, so no shed figures are claimed in this
+table.
+
+Also note the static arm is pinned at **one** worker. That is the honest baseline for "no
+adaptation", but it is not the strongest possible fixed configuration: a static pool of 4 would have
+absorbed this particular burst too, at the cost of running 4 workers permanently. The claim is about
+reacting to load without over-provisioning for peak, not about beating any fixed pool at any size.
+
+---
+
+# Claim #3 — Deterministic replay
+
+**Reproduce:** `docker compose run --rm tests pytest -q -s tests/integration/test_replay_determinism.py`
+or, standalone: `python -m src.replay.harness --record --runs 3`
+
+## Configuration
+
+| | |
+|---|---|
+| recording | 30 aircraft x 300s of event time, chaos ooo 0.25 @ 15s skew, dup 0.05, late 0.02 @ 120-240s, drop 0.01 |
+| messages replayed | **9,321** per replay, over 6 Kafka partitions |
+| pipeline | `collect()` -> watermark event-time windowing, 60s windows, 30s allowed lateness |
+| output hashed | SHA-256 over a canonical rendering: windows sorted, counts exact, means at fixed 4dp |
+| runs | 3 replays per invocation, invocation repeated 3x (9 replays total) |
+
+## Results
+
+| check | result |
+|---|---|
+| 3 replays of one recording | **identical digest, 3/3** |
+| windows produced | 185, identical across replays |
+| events collected | 9,321, identical across replays |
+| replay killed mid-stream, restarted | **digest matches the uninterrupted run** |
+| same events over 1 partition vs 6 | **identical digest** |
+| invocation repeated 3x | 4/4 tests pass each time, no flakes |
+
+Example (one invocation): `01ee39c42205d038a3f8735502ebf6784a58c7ec6d7fa7fa7689444bf74ddef7`,
+produced by three independent replays and again by a replay that was `SIGKILL`ed three seconds in
+and restarted from scratch.
+
+## What "identical" does and does not mean here
+
+**The digest is stable across replays of one recording, not across recordings.** Each invocation of
+the test lays down a fresh recording whose `start_time` is `now()`, so its absolute timestamps --
+and therefore its window boundaries and its digest -- differ from the last invocation's. That is
+correct: the claim is that replaying *the same bytes* yields the same aggregate, not that the
+generator emits the same bytes forever. The invariants that *are* stable across invocations are the
+structural ones: 9,321 messages and 185 windows every time.
+
+## Why it holds
+
+Three properties, all load-bearing, all of which were broken at some point during development:
+
+1. **A total order on the input.** `collect()` sorts by `(ingest_time, icao24, event_time)`. Sorting
+   on arrival instant alone is not enough: one generator tick emits a whole fleet sharing an
+   `ingest_time`, and Python's stable sort would leave those ties in whatever order the broker
+   interleaved the six partitions that run. The 1-partition-vs-6 test exists to pin this down.
+2. **Folding that cannot leak summation order.** Means are rounded at finalisation, so float
+   addition -- which is not associative -- cannot put the accumulation order into the output.
+3. **No wall clock in the hashed output.** Windows key on `event_time`, the watermark advances on
+   `event_time`, `trace_id` is derived from event content. Nothing the machine stamps at replay time
+   reaches the digest.
+
+The mid-stream-kill result rests on a fourth point, which is the operationally interesting one:
+a replay is a pure function of the recorded topic, so a crash costs progress and nothing else. There
+is no partial state to reconcile and no checkpoint to repair -- the restarted replay reads from
+offset 0 and lands on the same digest. Combined with the Phase 0.3 result (the *sink* survives
+`SIGKILL` with zero duplicate rows, via the database idempotency key), the pipeline is
+crash-safe at both ends: writes are idempotent, and reads are reproducible.

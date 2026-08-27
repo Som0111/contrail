@@ -273,3 +273,31 @@ the admin client's `describe_topics`, a real request every sample. The deeper le
 the code as a comment: a health signal whose unknown state renders as its healthy value will hide
 exactly the incident it exists to detect. The supervisor now also logs every sample, not only the
 ones that act, because the three silent runs were undiagnosable without the holds and their reasons.
+
+## 1.6 — Determinism is a property of the input order, not just the arithmetic
+`collect()` sorts arrivals by `(ingest_time, icao24, event_time)`, a total order, rather than by
+`ingest_time` alone. The weaker key looks sufficient and is not: one generator tick emits a whole
+fleet sharing an `ingest_time`, and Python's sort is stable, so those ties keep whatever order the
+broker happened to interleave the six partitions in on that run. The aggregate could then differ
+between replays of identical bytes. Alternative considered: make the fold order-independent instead
+(sum in a canonical order at finalisation, or use exact decimal arithmetic). Rejected as solving a
+smaller problem -- input order also determines *when a window finalises relative to a late arrival*,
+so two orderings can legitimately disagree about which events are late, and no amount of arithmetic
+care fixes that. Ordering the input is the fix; the rounding at finalisation is belt-and-braces
+against float non-associativity. `test_replay_is_insensitive_to_partition_interleaving` publishes
+one event list to a 1-partition and a 6-partition topic and asserts equal digests.
+
+## 1.6 — A recording is written unpaced; only a live source is paced
+`publish_events()` writes an already-materialised event list as fast as the broker accepts it, next
+to `publish()` which drains a live source at wall-clock pace. The first version of the replay
+harness used `publish()`, so laying down 300 seconds of event time took 300 real seconds and the
+test suite ran for a quarter of an hour. A recording carries its own `event_time` and `ingest_time`
+in each message, so the rate at which it is written is invisible to everything downstream -- pacing
+it buys nothing and costs the entire runtime. The paced path stays for the live pipeline, where the
+timing *is* the point.
+
+## 1.6 — Every replay gets a fresh consumer group
+`replay()` mints a new group id per call. Reusing a group would let a replay resume from committed
+offsets and hash a *suffix* of the recording while reporting it as the whole thing -- and it would
+do so silently, producing a plausible digest over the wrong data. A fresh group makes "read from
+offset 0" structural rather than something the caller has to remember.

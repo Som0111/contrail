@@ -22,7 +22,7 @@ from src.common.config import get_settings
 from src.common.logging import configure
 from src.common.models import FlightState
 from src.control.controller import ControllerConfig, Decision, LagController
-from src.control.lag_monitor import LagMonitor
+from src.control.lag_monitor import LagMonitor, LagSample
 from src.ingestor import sink
 
 log = logging.getLogger("contrail.control.supervisor")
@@ -48,6 +48,25 @@ class ShedState:
             self.cells_shed.add(cell)
             return False
         return True
+
+
+@dataclass
+class SupervisionResult:
+    decisions: list[Decision] = field(default_factory=list)
+    samples: list[LagSample] = field(default_factory=list)
+    shed_dropped: int = 0
+
+    @property
+    def peak_lag(self) -> int:
+        return max((s.total for s in self.samples), default=0)
+
+    @property
+    def final_lag(self) -> int:
+        return self.samples[-1].total if self.samples else 0
+
+    @property
+    def actions(self) -> list[Decision]:
+        return [d for d in self.decisions if d.changed]
 
 
 class WorkerPool:
@@ -96,16 +115,23 @@ async def supervise(
     bootstrap: str, topic: str, group: str, dsn: str,
     config: ControllerConfig, interval_s: float = 2.0,
     duration_s: float | None = None, shed_fraction: float = 0.25,
-    max_rate: float | None = None,
-) -> list[Decision]:
-    """Run the monitor -> controller -> pool loop. Returns every decision made."""
+    max_rate: float | None = None, static_workers: int | None = None,
+) -> SupervisionResult:
+    """Run the monitor -> controller -> pool loop.
+
+    With `static_workers` set the controller still observes and still logs, but
+    its decisions are not applied. That is deliberate: the 1.5 baseline must be
+    measured through exactly the same sampling path as the adaptive arm, so any
+    difference between the two is adaptation and not instrumentation.
+    """
     shed = ShedState()
     controller = LagController(config)
     monitor = LagMonitor(bootstrap, topic, group)
     pool = WorkerPool(bootstrap, topic, group, dsn, shed, max_rate=max_rate)
 
     await monitor.start()
-    await pool.scale_to(config.min_workers)
+    await pool.scale_to(static_workers if static_workers is not None else config.min_workers)
+    result = SupervisionResult()
     loop = asyncio.get_running_loop()
     deadline = None if duration_s is None else loop.time() + duration_s
 
@@ -114,6 +140,8 @@ async def supervise(
             await asyncio.sleep(interval_s)
             sample = await monitor.sample()
             decision = controller.observe(sample)
+            result.samples.append(sample)
+            result.decisions.append(decision)
             # Every sample, not only the ones that act: a controller that holds
             # is making a decision too, and without this the reason it held is
             # invisible. Also the lag time series the 1.5 benchmark measures.
@@ -126,10 +154,13 @@ async def supervise(
                     "t_stat": round(decision.t_stat, 2),
                     "workers": pool.size,
                     "shedding": decision.shedding,
-                    "action": decision.action,
+                    "action": decision.action if static_workers is None else "static",
                     "reason": decision.reason,
                 },
             )
+
+            if static_workers is not None:
+                continue  # observe and log, but never act
 
             if decision.action in ("scale_up", "scale_down"):
                 await pool.scale_to(decision.workers)
@@ -145,6 +176,7 @@ async def supervise(
                 )
                 shed.fraction = 0.0
     finally:
+        result.shed_dropped = shed.dropped
         await pool.close()
         await monitor.stop()
         log.info(
@@ -155,7 +187,7 @@ async def supervise(
                 "shed_cells": sorted(shed.cells_shed)[:20],
             },
         )
-    return controller.state.history
+    return result
 
 
 async def _main() -> None:

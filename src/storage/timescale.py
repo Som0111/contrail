@@ -31,10 +31,17 @@ CREATE TABLE IF NOT EXISTS flight_events (
     ingest_time   TIMESTAMPTZ      NOT NULL,
     partition_key TEXT             NOT NULL,
     trace_id      TEXT             NOT NULL,
+    -- Stamped by the database at write time, so end-to-end latency
+    -- (event_time -> durably stored) is a property of the row, not of whatever
+    -- clock the benchmark script happens to read.
+    processed_at  TIMESTAMPTZ      NOT NULL DEFAULT now(),
     -- Idempotency key. A hypertable's unique index must include the
     -- partitioning column, which event_time already is.
     UNIQUE (icao24, event_time)
 );
+
+ALTER TABLE flight_events
+    ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
 SELECT create_hypertable('flight_events', 'event_time', if_not_exists => TRUE);
 

@@ -43,6 +43,32 @@ async def ensure_topic(bootstrap: str, topic: str, partitions: int) -> None:
         await admin.close()
 
 
+async def publish_events(
+    events: list[FlightState], bootstrap: str, topic: str, partitions: int
+) -> int:
+    """Write an already-materialised event list as fast as the broker accepts it.
+
+    Not `publish()`: that drains a live source and is paced to wall clock, so
+    laying down 300s of event time would take 300 real seconds. A replay
+    recording carries its own timestamps, so the rate it is written at is
+    irrelevant to everything downstream -- only the contents matter.
+    """
+    await ensure_topic(bootstrap, topic, partitions)
+    producer = AIOKafkaProducer(bootstrap_servers=bootstrap, acks="all")
+    await producer.start()
+    try:
+        for event in events:
+            await producer.send(
+                topic,
+                value=event.model_dump_json().encode(),
+                key=event.partition_key.encode(),
+            )
+    finally:
+        await producer.stop()
+    log.info("published %d recorded events to %s", len(events), topic)
+    return len(events)
+
+
 async def publish(
     source: EventSource, bootstrap: str, topic: str, partitions: int
 ) -> int:
@@ -123,6 +149,12 @@ async def collect(
             events.extend(FlightState.model_validate_json(r.value) for r in records)
     finally:
         await consumer.stop()
-    events.sort(key=lambda e: e.ingest_time)
+    # Total order, not just by arrival instant. Many events share an ingest_time
+    # (one generator tick emits a whole fleet), and Python's sort is stable, so
+    # sorting on the timestamp alone leaves those ties in Kafka delivery order --
+    # which differs run to run. Determinism (Phase 1.6) needs the tie broken by
+    # something intrinsic to the event, so the replayed stream is byte-identical
+    # every time regardless of how the broker interleaved the partitions.
+    events.sort(key=lambda e: (e.ingest_time, e.icao24, e.event_time))
     log.info("collected %d events from %s", len(events), topic)
     return events

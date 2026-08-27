@@ -266,16 +266,23 @@ class LagController:
                 f"lag {lag} growing {trend.slope:.1f}/s (t={trend.t_stat:.1f}) "
                 f"for {st.growth_run} consecutive samples",
             )
+        # Note the `quiet` requirement. Releasing a worker merely because the
+        # slope turned negative gives capacity back while the backlog is still
+        # deep, which slows the drain and forces an immediate scale-up again --
+        # measured in the first 1.5 run, where the adaptive arm dropped 4->3->2
+        # at lag 8,374 and had to climb straight back to 4. Hold the pool until
+        # the backlog is genuinely small.
         if (
             st.drain_run >= c.confirm_samples
+            and quiet
             and st.workers > c.min_workers
             and not st.shedding
             and not growing
         ):
             return act(
                 "scale_down", st.workers - 1, st.shedding,
-                f"lag {lag} draining {trend.slope:.1f}/s for "
-                f"{st.drain_run} consecutive samples",
+                f"lag {lag} below {c.scale_down_lag} and draining "
+                f"{trend.slope:.1f}/s for {st.drain_run} consecutive samples",
             )
 
         if not real:
