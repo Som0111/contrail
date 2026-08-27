@@ -53,6 +53,7 @@ services:
     build:
       context: .
       target: base
+    restart: unless-stopped
     env_file:
       - path: .env
         required: false

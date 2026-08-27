@@ -43,16 +43,46 @@ async def lifespan(_app: FastAPI):
     conns["redis"] = aioredis.from_url(
         settings.redis_url, decode_responses=True, max_connections=64
     )
-    conns["pg"] = await asyncpg.create_pool(settings.postgres_dsn, min_size=2, max_size=16)
-    admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap)
-    await admin.start()
-    conns["kafka"] = admin
+    conns["pg"] = await _with_retry("postgres", lambda: asyncpg.create_pool(
+        settings.postgres_dsn, min_size=2, max_size=16))
+    conns["kafka"] = await _with_retry("kafka", _start_admin)
     try:
         yield
     finally:
-        await conns["kafka"].close()
-        await conns["pg"].close()
-        await conns["redis"].aclose()
+        for key, close in (("kafka", "close"), ("pg", "close"), ("redis", "aclose")):
+            if conns.get(key) is not None:
+                with contextlib.suppress(Exception):
+                    await getattr(conns[key], close)()
+
+
+async def _start_admin() -> AIOKafkaAdminClient:
+    admin = AIOKafkaAdminClient(bootstrap_servers=settings.kafka_bootstrap)
+    await admin.start()
+    return admin
+
+
+async def _with_retry(what: str, make, attempts: int = 30, delay_s: float = 2.0):
+    """Build a connection, retrying, and return None rather than refusing to start.
+
+    On a cold `docker compose up` TimescaleDB answers `pg_isready` while still
+    finishing first-time initialisation, so the first connection is refused and an
+    unguarded lifespan handler kills the process — the API was dead on a clean
+    checkout for exactly this reason. Retrying covers the slow start; returning
+    None covers the rest. An API that stays up and reports a broken dependency
+    through /healthz is strictly more useful than one that will not boot, and a
+    health endpoint that cannot run is the least useful thing in an outage.
+    """
+    for attempt in range(1, attempts + 1):
+        try:
+            return await make()
+        except Exception as exc:  # noqa: BLE001
+            if attempt == attempts:
+                log.error("giving up connecting to %s; starting degraded", what,
+                          extra={"error": f"{type(exc).__name__}: {exc}"})
+                return None
+            log.warning("waiting for %s (attempt %d/%d)", what, attempt, attempts)
+            await asyncio.sleep(delay_s)
+    return None
 
 
 conns: dict = {}
@@ -113,10 +143,14 @@ async def rate_limit(request: Request, call_next):
 # --------------------------------------------------------------------------- health
 
 async def _check_redpanda() -> None:
+    if conns.get("kafka") is None:
+        conns["kafka"] = await _start_admin()  # recover if it was down at startup
     await conns["kafka"].list_topics()
 
 
 async def _check_timescale() -> None:
+    if conns.get("pg") is None:
+        conns["pg"] = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=16)
     async with conns["pg"].acquire() as conn:
         version = await conn.fetchval(
             "SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'"
@@ -192,6 +226,8 @@ async def windows(
 @app.get("/api/status")
 async def api_status(_: str = Depends(require_auth)) -> JSONResponse:
     """Pipeline state: rows stored, cells with a finalized window, late total."""
+    if conns.get("pg") is None:
+        return JSONResponse(status_code=503, content={"detail": "database unavailable"})
     async with conns["pg"].acquire() as conn:
         stored = await conn.fetchval("SELECT count(*) FROM flight_events")
         latest = await conn.fetchval("SELECT max(event_time) FROM flight_events")

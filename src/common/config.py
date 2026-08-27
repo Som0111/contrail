@@ -44,9 +44,6 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://redis:6379/0"
 
-    api_host: str = "0.0.0.0"
-    api_port: int = 8000
-
     # Auth + rate limiting. jwt_secret MUST be overridden outside local dev;
     # the default exists so `docker compose up` works from a clean checkout.
     jwt_secret: str = "dev-only-change-me"
