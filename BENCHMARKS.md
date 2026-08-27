@@ -218,6 +218,95 @@ reacting to load without over-provisioning for peak, not about beating any fixed
 
 ---
 
+# Claim 2b — Load shedding under sustained overload
+
+Closes the gap named in the claim-2 section: with four workers the burst is absorbed outright and
+the shed path is never reached. Capping the pool at two forces the controller past its scaling
+ceiling while everything else stays identical.
+
+**Reproduce:** `docker compose run --rm --no-deps api python -m scripts.benchmark_control --max-workers 2`
+
+## Configuration
+
+Identical to claim 2 except the worker cap. Same harness, same controller, same lag sampler.
+
+| | |
+|---|---|
+| load | 60 aircraft; 120 ev/s for 30s -> **720 ev/s (6x) for 70s** -> 120 ev/s for 40s -> 60s drain |
+| per-worker cap | 250 ev/s, so two workers is 500 ev/s against 720 ev/s inflow — a 220 ev/s deficit scaling cannot close |
+| shed fraction | 0.25 of geographic cells, engaged after 3 consecutive at-max-and-still-growing samples |
+| static arm | pinned at 1 worker, controller observes but never acts |
+| machine / seed | as above; 20260827; 405s runtime |
+
+## Results
+
+| | static (1 worker) | adaptive (1-2, shedding) | |
+|---|---|---|---|
+| peak lag | 33,800 | **8,140** | 4.2x lower |
+| final lag | **14,980 — never recovered** | **0** | fully drained |
+| p50 latency | 49.60s | **9.31s** | 5.3x lower |
+| p95 latency | 107.10s | **16.43s** | 6.5x lower |
+| p99 latency | 117.02s | **19.04s** | 6.1x lower |
+| events stored | 44,880 (76.3%) | 44,242 (75.2%) | *lower, deliberately* |
+| events shed | 0 | **14,668** | counted, cells named |
+
+## Lag trajectory — the actual claim
+
+```
+  t=  32s lag=  1,620 w=1
+  t=  48s lag=  7,400 w=2 SHED   <- ceiling reached, shedding engages
+  t=  64s lag=  7,480 w=2 SHED
+  t=  80s lag=  8,060 w=2 SHED   <- burst still running, lag flat
+  t=  96s lag=  8,140 w=2 SHED
+  t= 112s lag=  1,856 w=2        <- burst over, shedding released
+  t= 128s lag=     60 w=1
+  t= 144s lag=      0 w=1
+```
+
+Controller sequence: `scale_up` at lag 4,700 (+490.0/s, t=18.4) to the 2-worker ceiling; `shed` at
+7,520 (+489.0/s) after three consecutive at-max-and-growing samples; `unshed` at 2,632 once the trend
+turned (-485.3/s); `scale_down` at 60.
+
+**Lag held in a 7,400-8,140 band for the remaining ~50 seconds of the burst rather than climbing.**
+That is the whole point of the mechanism: scaling had run out, and the choice was between bounded
+degradation and unbounded lag. The static arm shows the alternative — 33,800 peak and still 14,980
+behind a minute after the burst ended.
+
+## The honest cost
+
+Shedding **stores less data than the baseline**: 44,242 rows against the static arm's 44,880. That is
+the trade being made, not a defect — 14,668 events were dropped on purpose, each counted, each
+belonging to a geographic cell the supervisor logs by name. Every surviving cell's aggregate is
+exactly correct; the shed cells are simply dark for the duration. That is the design intent
+(DESIGN_DECISIONS.md 1.4), and it buys a 6.1x better p99 and a pipeline that actually recovers.
+
+A small accounting caveat, stated rather than smoothed: 44,242 stored + 14,668 shed is 58,910 against
+58,800 published, an excess of 110 (0.2%). The shed counter counts *deliveries*, not unique events,
+so a consumer-group rebalance during a scale action can count one shed record twice. It does not
+affect the stored count or the lag figures.
+
+## The bug this run exposed
+
+The first attempt at this benchmark showed shedding engaging at lag 7,340 and **lag continuing to
+climb to 20,400 anyway** — the mechanism appeared to do nothing. It was not the controller. The
+per-worker rate cap that makes worker count the binding constraint was throttling on records
+*consumed* rather than records *written*:
+
+```python
+await asyncio.sleep(len(consumed) / max_rate)   # before
+await asyncio.sleep(len(events)   / max_rate)   # after
+```
+
+The ceiling stands in for per-worker write capacity, and a shed record is never written — so billing
+for discarded work made shedding structurally incapable of buying back throughput. It could only
+relieve lag by coincidence, which is precisely how it behaved. With the cap charging for work
+actually done, peak lag fell from 20,400 to 8,140 and p99 from 53.43s to 19.04s.
+
+**This does not change the claim-2 figures.** When nothing is shed, `events` and `consumed` are the
+same list, so the fix is a no-op for every run in which shedding never engages — which is every run
+in the claim-2 table.
+---
+
 # Claim #3 — Deterministic replay
 
 **Reproduce:** `docker compose run --rm tests pytest -q -s tests/integration/test_replay_determinism.py`

@@ -496,3 +496,24 @@ python as PID 1 — which the kernel makes immune to signals from inside its own
 neither could be crash-tested at all and neither would have honoured its restart policy. All three
 now use the same wrapper. Uniformity here is not tidiness: an untestable service is one whose
 recovery behaviour you are guessing at.
+
+## 2.9 — A simulated capacity ceiling must charge for work done, not work offered
+The per-worker rate cap that makes worker count the binding constraint in the control benchmarks was
+throttling on records consumed rather than records written. Since shedding removes the write and not
+the read, the cap billed full price for records that were deliberately discarded — which left the
+shed path structurally unable to buy back any throughput. Shedding looked ineffective for one
+complete benchmark run before the cause turned out to be the measuring instrument rather than the
+mechanism. Charging on the post-filter list fixed it: peak lag under a two-worker cap fell from
+20,400 to 8,140 and p99 from 53.43s to 19.04s. The general lesson is worth more than the fix — a
+synthetic ceiling models a real cost, and it has to be charged at the same point in the pipeline
+where the real cost is incurred, or it quietly invalidates whatever the benchmark was built to test.
+Note this changes nothing when shedding is inactive, because the pre- and post-filter lists are then
+identical, which is why the claim-2 figures are unaffected.
+
+## 2.9 — Two workers as the shed benchmark's cap
+Chosen so the arithmetic forces the ceiling rather than flirting with it: two workers at the 250 ev/s
+cap is 500 ev/s against a 720 ev/s burst, a 220 ev/s deficit no amount of scaling can close. Three
+workers would have been 750 ev/s, marginally above inflow, and the run would have been a coin toss
+between stabilising and shedding — an ambiguous result proves nothing. Four is what claim 2 already
+uses, and absorbs the burst outright. No tuning of thresholds or shed fraction was needed; the
+default 0.25 of cells was enough to hold lag flat once the throughput accounting was corrected.

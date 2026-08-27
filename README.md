@@ -167,9 +167,12 @@ Known limitations, all documented in full in [DESIGN_DECISIONS.md](DESIGN_DECISI
   wall-clock idleness timeout, which would put non-determinism into the processor claim 3 depends on.
 - **Live data concentrates in four geographic cells** under the default bounding box, so partition
   balance measured on worldwide synthetic traffic does not transfer to a regional live feed.
-- **Load shedding is not exercised by the claim-2 benchmark** — four workers absorb that burst
-  outright. Shedding is evidenced by the Phase 1.4 integration run instead, and BENCHMARKS.md says so
-  rather than implying the benchmark covers it.
+- **Load shedding is measured separately, at a two-worker cap** (claim 2b in BENCHMARKS.md), because
+  the four workers in claim 2 absorb that burst outright and never reach the ceiling. What claim 2b
+  shows is bounded degradation under an overload scaling cannot fix: lag held flat at ~8,100 instead
+  of climbing, at the cost of 14,668 deliberately dropped events. What it does not show is shedding
+  at any other fraction or overload ratio — 0.25 of cells against a 220 ev/s deficit is one point on
+  a curve, not a characterisation.
 - **Under a sustained 6x burst the pipeline stabilises lag rather than clearing it.** Bounded, not
   unbounded, which is the design intent — but it is not "full recovery under sustained overload".
 - The API load-test figures at 100 users are CPU-bound on a two-core laptop running the entire stack

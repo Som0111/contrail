@@ -138,6 +138,19 @@ def print_arm(arm: Arm) -> None:
           f"   shed {sup.shed_dropped:,}")
     print(f"    latency   p50 {arm.p50:7.2f}s   p95 {arm.p95:7.2f}s"
           f"   p99 {arm.p99:7.2f}s   max {arm.max_latency:7.2f}s")
+    # Lag and shedding over time. A single peak number cannot show whether lag
+    # stabilised or was still climbing when the run ended, which is the whole
+    # question once shedding is involved.
+    samples = sup.samples
+    if samples and not arm.static:
+        step = max(1, len(samples) // 12)
+        print("    trajectory (lag / workers / shedding):")
+        for i in range(0, len(samples), step):
+            d = sup.decisions[i]
+            bar = "#" * min(40, int(samples[i].total / 250))
+            print(f"      t={i * 2:>4}s lag={samples[i].total:>7,} w={d.workers} "
+                  f"{'SHED' if d.shedding else '    '} {bar}")
+
     if arm.static:
         # The controller still runs in the static arm so both arms share one
         # sampling path -- but nothing it decides is applied. Saying "actions"
