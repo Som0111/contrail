@@ -33,12 +33,20 @@ import logging
 import platform
 import time
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from src.ingestor.synthetic import ChaosConfig, SyntheticSource
 from src.windowing import naive, watermark
 from src.windowing.aggregates import compare, ground_truth, window_start
 
 WINDOW_S = 60
+
+# Pinned, not `now()`. The seed alone fixes the aircraft and the chaos draws, but
+# `start_time` defaults to the wall clock, which slides every event's timestamp
+# and therefore moves events across window boundaries -- enough to shift the
+# reported figures by a few tenths of a percent between runs. A benchmark that
+# claims reproducibility has to fix the epoch too.
+EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 
 
 @dataclass
@@ -105,7 +113,7 @@ def run_level(level: Level, aircraft: int, ticks: int, seed: int) -> list[dict]:
     events = list(
         SyntheticSource(
             n_aircraft=aircraft, rate_hz=1.0, chaos=level.chaos,
-            seed=seed, duration_s=ticks,
+            seed=seed, duration_s=ticks, start_time=EPOCH,
         ).simulate()
     )
     truth = ground_truth(events, WINDOW_S)
