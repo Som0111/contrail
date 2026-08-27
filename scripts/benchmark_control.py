@@ -44,6 +44,7 @@ SELECT
 FROM (
     SELECT extract(epoch FROM (processed_at - event_time)) AS latency
     FROM flight_events
+    WHERE icao24 = ANY($1::text[])
 ) s
 """
 
@@ -79,9 +80,17 @@ async def run_arm(name: str, static_workers: int | None, args) -> Arm:
     tag = uuid.uuid4().hex[:8]
     topic, group = f"bench.control.{tag}", f"bench-control-{tag}"
 
+    # Scope everything to the aircraft this arm generates. The demo pipeline runs
+    # continuously as a compose service and writes to the same table, so counting
+    # or truncating the whole table would mix its traffic into the measurement.
+    fleet = [
+        a.icao24 for a in SyntheticSource(
+            n_aircraft=args.aircraft, rate_hz=1.0, seed=args.seed, duration_s=1
+        ).fleet
+    ]
     pool = await timescale.connect(s.postgres_dsn, min_size=1, max_size=2)
     await timescale.ensure_schema(pool)
-    await timescale.truncate(pool)
+    await timescale.delete_events(pool, fleet)
 
     phases = [
         (args.baseline_s, args.base_rate),
@@ -107,9 +116,9 @@ async def run_arm(name: str, static_workers: int | None, args) -> Arm:
     published = await load(s.kafka_bootstrap, topic, phases, args.aircraft, args.seed)
     supervision = await supervisor
 
-    stored = await timescale.count_events(pool)
+    stored = await timescale.count_events(pool, fleet)
     async with pool.acquire() as conn:
-        row = await conn.fetchrow(LATENCY_SQL)
+        row = await conn.fetchrow(LATENCY_SQL, fleet)
     await pool.close()
 
     return Arm(

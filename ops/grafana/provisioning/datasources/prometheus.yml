@@ -1,0 +1,14 @@
+apiVersion: 1
+datasources:
+  - name: Prometheus
+    # Pinned. Without an explicit uid Grafana generates a random one at
+    # provisioning time, and every panel in contrail.json -- which references
+    # uid "prometheus" -- fails with "Datasource prometheus was not found".
+    # The dashboard API still returns 200 and the queries still work against
+    # Prometheus directly, so the only way to catch it is to look at the page.
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

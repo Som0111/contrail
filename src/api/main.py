@@ -9,15 +9,19 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 
 import asyncpg
 import redis.asyncio as aioredis
 from aiokafka.admin import AIOKafkaAdminClient
 from fastapi import Depends, FastAPI, Query, Request, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
 
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+
 from src.api.auth import RateLimiter, client_id, decode_token, issue_token, require_auth
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.logging import configure
 from src.windowing.service import CHANNEL, CURRENT_KEY
@@ -46,11 +50,31 @@ def redis_client() -> aioredis.Redis:
     return aioredis.from_url(settings.redis_url, decode_responses=True)
 
 
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.middleware("http")
+async def observe(request: Request, call_next):
+    # Label on the route template, never the raw path: labelling on `request.url.path`
+    # would mint a new time series per distinct query target and blow up cardinality.
+    route = request.scope.get("route")
+    path = getattr(route, "path", None) or request.url.path
+    started = time.perf_counter()
+    response = await call_next(request)
+    metrics.API_LATENCY.labels(request.method, path).observe(time.perf_counter() - started)
+    metrics.API_REQUESTS.labels(request.method, path, str(response.status_code)).inc()
+    return response
+
+
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
     # /healthz is exempt: an orchestrator probing liveness must never be told to
     # back off, or a burst of real traffic would take the instance out of rotation.
-    if request.url.path != "/healthz" and not limiter.allow(client_id(request)):
+    if request.url.path not in ("/healthz", "/metrics") and not limiter.allow(
+        client_id(request)
+    ):
         return JSONResponse(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             content={"detail": "rate limit exceeded"},
@@ -194,6 +218,7 @@ async def ws_windows(websocket: WebSocket, token: str = Query(...)) -> None:
         return
 
     await websocket.accept()
+    metrics.WS_CLIENTS.inc()
     client = redis_client()
     pubsub = client.pubsub()
     await pubsub.subscribe(CHANNEL)
@@ -212,6 +237,7 @@ async def ws_windows(websocket: WebSocket, token: str = Query(...)) -> None:
     except (WebSocketDisconnect, RuntimeError, ConnectionError):
         log.info("ws client disconnected")
     finally:
+        metrics.WS_CLIENTS.dec()
         with contextlib.suppress(Exception):
             await pubsub.unsubscribe(CHANNEL)
             await pubsub.aclose()

@@ -20,10 +20,12 @@ import argparse
 import asyncio
 import json
 import logging
+from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
 from aiokafka import AIOKafkaConsumer
 
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.logging import configure
 from src.common.models import FlightState
@@ -66,6 +68,7 @@ async def run(
     pending: list[WindowAggregate] = []
     processor = WatermarkProcessor(window_s, allowed_lateness_s, on_finalize=pending.append)
     finalized = 0
+    reported_late = 0
     loop = asyncio.get_running_loop()
     deadline = None if duration_s is None else loop.time() + duration_s
 
@@ -85,12 +88,25 @@ async def run(
                     pipe.hset(CURRENT_KEY, aggregate.partition_key, payload)
                 await pipe.execute()
                 finalized += len(pending)
+                metrics.WINDOWS_FINALIZED.inc(len(pending))
                 log.info(
                     "windows finalized",
                     extra={"count": len(pending), "total": finalized,
                            "watermark": processor.watermark},
                 )
                 pending.clear()
+
+            mark = processor.watermark
+            if mark is not None:
+                metrics.WATERMARK_SKEW_WALLCLOCK.set(
+                    (datetime.now(UTC) - mark).total_seconds()
+                )
+                metrics.WATERMARK_SKEW_EVENT.set(
+                    (processor.max_event_time - mark).total_seconds()
+                )
+            if processor.late_count > reported_late:
+                metrics.LATE_EVENTS.inc(processor.late_count - reported_late)
+                reported_late = processor.late_count
     finally:
         result = processor.close()
         if pending:  # whatever close() flushed
@@ -117,8 +133,11 @@ async def _main() -> None:
     p.add_argument("--window-s", type=int, default=s.window_s)
     p.add_argument("--allowed-lateness-s", type=float, default=s.allowed_lateness_s)
     p.add_argument("--duration", type=float, default=None)
+    p.add_argument("--metrics-port", type=int, default=s.metrics_port)
     args = p.parse_args()
     configure(s.log_level)
+    if args.metrics_port:
+        metrics.serve(args.metrics_port)
     await run(args.bootstrap, args.topic, args.group, args.redis_url,
               args.window_s, args.allowed_lateness_s, args.duration)
 

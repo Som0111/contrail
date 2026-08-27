@@ -48,6 +48,7 @@ class Settings(BaseSettings):
     rate_limit_rps: float = 10.0
     rate_limit_burst: float = 20.0
     log_level: str = "INFO"
+    metrics_port: int = 9100
 
     @property
     def postgres_dsn(self) -> str:

@@ -356,3 +356,49 @@ handshake rather than being allowed to hold an open connection it can never use.
 that the token can appear in access logs and proxy logs in a way an `Authorization` header would not;
 with a 1-hour TTL and a single operator account that is acceptable here, and the fix if it ever
 matters is a short-lived ticket issued over REST and exchanged at the handshake.
+
+## 2.2 — Two watermark skews, because either alone lies
+`watermark_skew_wallclock` is `now - watermark`: how stale the engine's notion of completeness is.
+`watermark_skew_event` is `max event_time seen - watermark`: whether the watermark is doing what it
+was configured to do, and it sits at almost exactly the allowed lateness. The pair is necessary
+because each is blind in the opposite direction. Wall-clock skew grows both when the pipeline falls
+behind *and* when data simply stops arriving, so an idle pipeline looks broken. Event skew stays
+flat at the configured bound whatever happens upstream, so a completely stalled pipeline looks
+healthy. Only together do they distinguish "behind", "idle" and "misconfigured". The live dashboard
+shows event skew pinned at 30.0s against a configured 30s allowed lateness, which is also a
+continuous check that the config in the file is the config in the process.
+
+## 2.2 — Each process is its own scrape target
+`api`, `windowing` and `pipeline` each serve `/metrics` and Prometheus scrapes them separately with
+a `component` label. Alternative: one exporter, or a pushgateway. Rejected because the question this
+dashboard exists to answer is "which stage is behind", and aggregating the processes behind a single
+endpoint erases exactly that. The cost is a gotcha, described next.
+
+## 2.2 — Every dashboard query is scoped to the component that owns the metric
+All three processes import the shared metrics module, so all three *register* the full metric set and
+expose unset gauges as `0`. An unscoped `contrail_workers` returns three series -- `pipeline`=1 and
+two phantom zeros -- and `sum()` over it would be silently wrong. Caught by querying Prometheus
+during the check and seeing 0 where the process itself reported 1. Every panel now selects on
+`{component="..."}`. The alternative, having each process register only its own metrics, is
+structurally cleaner but means splitting the metrics module by domain and losing the single place
+where names are defined; scoping the queries keeps names in one file and puts ownership in the
+dashboard, where it is visible.
+
+## 2.2 — Grafana provisioning must pin the datasource UID
+The dashboard was blank on first render: 72 console errors, all `Datasource prometheus was not
+found`. Without an explicit `uid:` in the datasource provisioning file, Grafana generates a random
+one (`PBFA97CFB590B2093` here), while every panel in `contrail.json` references `uid: "prometheus"`.
+Nothing else catches this -- the dashboard API returned 200 with all 12 panels, and every panel query
+returned data when run against Prometheus directly. Only looking at the rendered page revealed it.
+That is why the roadmap's "take a screenshot" step is a real check and not documentation busywork.
+
+## 2.2 — The demo pipeline runs as compose services, so tests scope to their own data
+`windowing`, `pipeline` and `generator` are now long-running compose services, so a single
+`docker compose up` produces a live system with a populated dashboard instead of an empty one. The
+consequence: something is always writing to `flight_events`. Two integration tests that
+`TRUNCATE`d the table and counted every row immediately began failing -- deterministically, this
+time; the same tests had flaked once before under transient contention, which in hindsight was the
+early warning. Both now derive the icao24 set of the fleet they generate and scope their deletes,
+counts and duplicate checks to it, which makes them independent of anything else writing. The
+control benchmark got the same treatment, since a demo pipeline writing rows would otherwise pollute
+its latency percentiles.

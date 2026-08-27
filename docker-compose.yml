@@ -73,6 +73,71 @@ services:
       retries: 10
     networks: [contrail]
 
+
+  # The pipeline as real long-running services, so a single `docker compose up`
+  # produces a live system with a populated dashboard rather than an empty one.
+  windowing:
+    build: {context: ., target: base}
+    command: python -m src.windowing.service
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:29092
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_HOST: timescaledb
+    depends_on:
+      redpanda: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    networks: [contrail]
+
+  pipeline:
+    build: {context: ., target: base}
+    # The adaptive supervisor: sink workers plus the lag controller.
+    command: python -m src.control.supervisor --max-rate 250 --max-workers 4
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:29092
+      REDIS_URL: redis://redis:6379/0
+      POSTGRES_HOST: timescaledb
+    depends_on:
+      redpanda: {condition: service_healthy}
+      timescaledb: {condition: service_healthy}
+    networks: [contrail]
+
+  generator:
+    build: {context: ., target: base}
+    command: >
+      python -m src.ingestor.synthetic --aircraft 40 --rate 2
+      --out-of-order-prob 0.15 --max-skew-s 20 --duplicate-prob 0.03
+      --late-prob 0.01 --drop-prob 0.01
+    environment:
+      KAFKA_BOOTSTRAP: redpanda:29092
+    depends_on:
+      redpanda: {condition: service_healthy}
+    networks: [contrail]
+
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+    volumes:
+      - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    networks: [contrail]
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: light
+    volumes:
+      - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [contrail]
+
   # `docker compose run --rm tests` -- not started by `docker compose up`.
   tests:
     build:

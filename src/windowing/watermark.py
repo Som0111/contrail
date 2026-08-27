@@ -95,6 +95,11 @@ class WatermarkProcessor:
         self._result = WatermarkResult()
 
     @property
+    def late_count(self) -> int:
+        """Events sent to the side output so far. Public so metrics need not pry."""
+        return len(self._result.late)
+
+    @property
     def max_event_time(self) -> datetime | None:
         return max(self._max_by_source.values(), default=None)
 

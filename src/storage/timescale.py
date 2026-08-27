@@ -118,11 +118,33 @@ async def insert_events(pool: asyncpg.Pool, events: list[FlightState]) -> int:
     return int(status.rsplit(" ", 1)[1])
 
 
-async def count_events(pool: asyncpg.Pool) -> int:
+async def count_events(pool: asyncpg.Pool, icao24s: list[str] | None = None) -> int:
+    """Count rows, optionally scoped to a set of aircraft.
+
+    The scoped form exists because the demo pipeline runs continuously as a
+    compose service, so any test or benchmark that counts the whole table is
+    counting someone else's traffic too. Scoping to the aircraft you generated
+    makes a test independent of whatever else is writing.
+    """
     async with pool.acquire() as conn:
-        return await conn.fetchval("SELECT count(*) FROM flight_events")
+        if icao24s is None:
+            return await conn.fetchval("SELECT count(*) FROM flight_events")
+        return await conn.fetchval(
+            "SELECT count(*) FROM flight_events WHERE icao24 = ANY($1::text[])",
+            list(icao24s),
+        )
+
+
+async def delete_events(pool: asyncpg.Pool, icao24s: list[str]) -> int:
+    """Remove only this caller's rows. Preferred over truncate() for isolation."""
+    async with pool.acquire() as conn:
+        status = await conn.execute(
+            "DELETE FROM flight_events WHERE icao24 = ANY($1::text[])", list(icao24s)
+        )
+    return int(status.rsplit(" ", 1)[1])
 
 
 async def truncate(pool: asyncpg.Pool) -> None:
+    """Wipe the whole table. Only safe when nothing else is writing."""
     async with pool.acquire() as conn:
         await conn.execute("TRUNCATE flight_events")

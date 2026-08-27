@@ -26,6 +26,13 @@ SETTINGS = get_settings()
 T0 = datetime(2026, 1, 1, tzinfo=UTC)
 
 
+def _fleet(n_aircraft=30, seed=4242) -> list[str]:
+    """The icao24 values this module owns, so its assertions can be scoped."""
+    src = SyntheticSource(n_aircraft=n_aircraft, rate_hz=1.0, seed=seed,
+                          duration_s=1, start_time=T0)
+    return [a.icao24 for a in src.fleet]
+
+
 def make_events(n_aircraft=25, ticks=40, seed=4242):
     """A fixed batch with real duplicates in it, so suppression has work to do."""
     source = SyntheticSource(
@@ -37,6 +44,9 @@ def make_events(n_aircraft=25, ticks=40, seed=4242):
         start_time=T0,
     )
     return list(source.simulate())
+
+
+OUR_AIRCRAFT = _fleet()
 
 
 async def produce(topic, events, partitions=3):
@@ -54,11 +64,23 @@ async def produce(topic, events, partitions=3):
 
 @pytest.fixture
 async def pool():
+    """Scoped to this module's aircraft, never TRUNCATE.
+
+    The demo pipeline runs continuously as a compose service and writes to the
+    same table, so a test that truncates and then counts every row is counting
+    the demo's traffic as its own -- which is exactly how these two tests started
+    failing once `pipeline` became a compose service.
+    """
     p = await timescale.connect(SETTINGS.postgres_dsn, min_size=1, max_size=4)
     await timescale.ensure_schema(p)
-    await timescale.truncate(p)
+    await timescale.delete_events(p, OUR_AIRCRAFT)
     yield p
+    await timescale.delete_events(p, OUR_AIRCRAFT)
     await p.close()
+
+
+async def count_ours(pool) -> int:
+    return await timescale.count_events(pool, OUR_AIRCRAFT)
 
 
 def drain(topic, group):
@@ -82,11 +104,11 @@ async def test_replaying_the_same_batch_twice_changes_nothing(pool):
     await produce(topic, events)
 
     first = await drain(topic, f"g1-{uuid.uuid4().hex[:8]}")
-    after_first = await timescale.count_events(pool)
+    after_first = await count_ours(pool)
 
     # Second pass: a brand-new consumer group re-reads the same topic from offset 0.
     second = await drain(topic, f"g2-{uuid.uuid4().hex[:8]}")
-    after_second = await timescale.count_events(pool)
+    after_second = await count_ours(pool)
 
     assert first.consumed == len(events)
     assert after_first == unique, "row count must equal unique events, not messages"
@@ -121,7 +143,7 @@ async def test_consumer_killed_mid_run_leaves_no_duplicates(pool):
     written = 0
     for _ in range(100):
         await asyncio.sleep(0.2)
-        written = await timescale.count_events(pool)
+        written = await count_ours(pool)
         if 0 < written < unique:
             break
     assert 0 < written < unique, f"kill must land mid-stream, saw {written}/{unique} rows"
@@ -129,12 +151,12 @@ async def test_consumer_killed_mid_run_leaves_no_duplicates(pool):
     proc.kill()
     await proc.wait()
     assert proc.returncode != 0, "process must have been killed, not exited cleanly"
-    killed_at = await timescale.count_events(pool)
+    killed_at = await count_ours(pool)
 
     # Restart with the SAME group: it resumes from the last committed offset and
     # re-delivers anything that was written but not committed.
     restarted = await drain(topic, group)
-    final = await timescale.count_events(pool)
+    final = await count_ours(pool)
 
     print(
         f"\n  killed after {killed_at}/{unique} rows; restart re-read "
@@ -148,8 +170,9 @@ async def test_consumer_killed_mid_run_leaves_no_duplicates(pool):
         dupes = await conn.fetchval(
             "SELECT count(*) FROM ("
             "  SELECT icao24, event_time FROM flight_events"
+            "  WHERE icao24 = ANY($1::text[])"
             "  GROUP BY icao24, event_time HAVING count(*) > 1"
-            ") d"
+            ") d", OUR_AIRCRAFT
         )
     assert dupes == 0, "unique constraint must have held across the restart"
 

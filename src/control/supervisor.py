@@ -18,6 +18,7 @@ import logging
 from dataclasses import dataclass, field
 from hashlib import blake2s
 
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.logging import configure
 from src.common.models import FlightState
@@ -142,6 +143,15 @@ async def supervise(
             decision = controller.observe(sample)
             result.samples.append(sample)
             result.decisions.append(decision)
+
+            metrics.CONSUMER_LAG.set(sample.total)
+            for partition, lag in sample.per_partition.items():
+                metrics.CONSUMER_LAG_PARTITION.labels(str(partition)).set(lag)
+            metrics.LAG_SLOPE.set(decision.slope)
+            metrics.WORKERS.set(pool.size)
+            metrics.SHEDDING.set(1 if decision.shedding else 0)
+            if decision.changed:
+                metrics.CONTROL_ACTIONS.labels(decision.action).inc()
             # Every sample, not only the ones that act: a controller that holds
             # is making a decision too, and without this the reason it held is
             # invisible. Also the lag time series the 1.5 benchmark measures.
@@ -205,10 +215,13 @@ async def _main() -> None:
     p.add_argument("--cooldown-s", type=float, default=10.0)
     p.add_argument("--growth-threshold", type=float, default=5.0)
     p.add_argument("--max-rate", type=float, default=None, help="per-worker events/s cap")
+    p.add_argument("--metrics-port", type=int, default=s.metrics_port)
     p.add_argument("--static-workers", type=int, default=None,
                    help="disable the controller and hold this worker count (baseline run)")
     args = p.parse_args()
     configure(s.log_level)
+    if args.metrics_port:
+        metrics.serve(args.metrics_port)
 
     if args.static_workers:
         # The 1.5 baseline: same pipeline, no adaptation.

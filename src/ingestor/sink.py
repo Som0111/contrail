@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from datetime import UTC, datetime
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -18,6 +19,7 @@ from aiokafka import AIOKafkaConsumer
 from src.common.config import get_settings
 from src.ingestor.base import ensure_topic
 from src.common.logging import configure
+from src.common import metrics
 from src.common.models import FlightState
 from src.storage import timescale
 
@@ -95,6 +97,15 @@ async def run(
             # discarded, so replaying them would undo the shedding decision.
             await consumer.commit()
 
+            now = datetime.now(UTC)
+            for e in events:
+                metrics.E2E_LATENCY.observe((now - e.event_time).total_seconds())
+            metrics.EVENTS.labels("inserted").inc(inserted)
+            metrics.EVENTS.labels("suppressed").inc(len(events) - inserted)
+            if shed:
+                metrics.EVENTS.labels("shed").inc(shed)
+                metrics.SHED_EVENTS.inc(shed)
+
             stats.consumed += len(consumed)
             stats.inserted += inserted
             stats.suppressed += len(events) - inserted
@@ -140,6 +151,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--dsn", default=s.postgres_dsn)
     p.add_argument("--batch-size", type=int, default=500)
     p.add_argument("--partitions", type=int, default=s.kafka_partitions)
+    p.add_argument("--metrics-port", type=int, default=s.metrics_port)
     p.add_argument("--max-rate", type=float, default=None, help="per-worker events/s cap")
     p.add_argument(
         "--idle-timeout",
@@ -153,6 +165,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
 async def _main(argv=None) -> None:
     args = _parse_args(argv)
     configure(get_settings().log_level)
+    if args.metrics_port:
+        metrics.serve(args.metrics_port)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
