@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 import signal
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from aiokafka import AIOKafkaConsumer
@@ -28,6 +29,7 @@ class SinkStats:
     consumed: int = 0
     inserted: int = 0
     suppressed: int = 0
+    shed: int = 0
     batches: int = 0
 
 
@@ -41,6 +43,8 @@ async def run(
     idle_timeout_s: float | None = None,
     partitions: int | None = None,
     stop: asyncio.Event | None = None,
+    event_filter: Callable[[FlightState], bool] | None = None,
+    max_rate: float | None = None,
 ) -> SinkStats:
     # Subscribing to a missing topic auto-creates it with ONE partition, which
     # would silently cap parallelism. Claim the right shape regardless of whether
@@ -74,21 +78,36 @@ async def run(
                 continue
             idle_for = 0.0
 
-            events = [FlightState.model_validate_json(r.value) for r in records]
-            inserted = await timescale.insert_events(pool, events)
+            consumed = [FlightState.model_validate_json(r.value) for r in records]
+            events = consumed
+            shed = 0
+            if event_filter is not None:
+                events = [e for e in consumed if event_filter(e)]
+                shed = len(consumed) - len(events)
+
+            if max_rate:
+                # ponytail: per-worker throughput ceiling so worker count is the
+                # real capacity knob; without it one batched writer out-runs any
+                # generator this machine can produce and scaling proves nothing.
+                await asyncio.sleep(len(consumed) / max_rate)
+            inserted = await timescale.insert_events(pool, events) if events else 0
+            # Shed records are committed too: they were consumed and deliberately
+            # discarded, so replaying them would undo the shedding decision.
             await consumer.commit()
 
-            stats.consumed += len(events)
+            stats.consumed += len(consumed)
             stats.inserted += inserted
             stats.suppressed += len(events) - inserted
+            stats.shed += shed
             stats.batches += 1
             log.info(
                 "batch written",
                 extra={
-                    "consumed": len(events),
+                    "consumed": len(consumed),
                     "inserted": inserted,
                     "suppressed": len(events) - inserted,
-                    "first_trace_id": timescale.trace_id(events[0]),
+                    "shed": shed,
+                    "first_trace_id": timescale.trace_id(consumed[0]),
                     "offsets": {
                         f"{tp.topic}:{tp.partition}": (rs[0].offset, rs[-1].offset)
                         for tp, rs in batches.items()
@@ -105,6 +124,7 @@ async def run(
                 "consumed": stats.consumed,
                 "inserted": stats.inserted,
                 "suppressed": stats.suppressed,
+                "shed": stats.shed,
                 "batches": stats.batches,
             },
         )
@@ -120,6 +140,7 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--dsn", default=s.postgres_dsn)
     p.add_argument("--batch-size", type=int, default=500)
     p.add_argument("--partitions", type=int, default=s.kafka_partitions)
+    p.add_argument("--max-rate", type=float, default=None, help="per-worker events/s cap")
     p.add_argument(
         "--idle-timeout",
         type=float,
@@ -147,6 +168,7 @@ async def _main(argv=None) -> None:
         idle_timeout_s=args.idle_timeout,
         partitions=args.partitions,
         stop=stop,
+        max_rate=args.max_rate,
     )
 
 

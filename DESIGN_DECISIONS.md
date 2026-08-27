@@ -216,3 +216,60 @@ deviation — plus a fourth column, `silent`, which is the one that matters oper
 the baseline misplaces is misplaced with no record; every event the watermark engine cannot place is
 in a counted side output. Under high disorder with late arrivals that is 16,487 silent errors against
 0. A single "accuracy" headline would have hidden the difference that actually matters in production.
+
+## 1.4 — Lag derivative, not lag threshold
+A threshold controller asks "is lag above N?", which is wrong in both directions. A large but
+*shrinking* lag needs no action -- the system is already recovering and extra workers are waste --
+yet recovery and collapse look identical to a threshold. A small but rapidly growing lag needs action
+immediately, but a threshold cannot act until the burst has already been unabsorbed long enough to
+cross the line. Worse, it flaps: with lag hovering near N, consecutive samples straddling the line
+produce opposite decisions, and each decision is a consumer-group rebalance that halts consumption
+briefly, raising lag, triggering the next one. The failure feeds itself. So the controller fits a
+least-squares line over a sliding window and acts on the gradient. Alternatives considered: a PID
+loop (rejected -- three coefficients to tune with no principled way to choose them here, and the
+integral term is actively harmful when the actuator is quantised to whole workers), and an EWMA of
+lag (rejected -- smooths the level, still answers the threshold question).
+
+## 1.4 — A slope is not enough: the trend must be statistically significant
+The first version used slope alone against a 5 events/s threshold, and the anti-flap test caught it
+immediately: fed lag jittering +/-12% around a flat 1000, it scaled up three times and then shed.
+A random walk over a short window produces slopes far above any fixed rate threshold, and least
+squares does not save you -- on four points, one 10x spike still yields 91% of the naive endpoint
+slope. So the fitted gradient is divided by its own standard error and must clear a significance
+bound as well as the rate threshold. Under noise the residuals are large, the standard error swamps
+the gradient, and nothing fires.
+
+The threshold value itself was the second mistake. `significance = 3.0` was chosen as "3 sigma",
+which is a *normal* approximation and wrong for a 6-sample window: with 4 degrees of freedom the
+t-distribution has heavy tails, and measurement showed t >= 3.0 firing on 4.62% of pure-noise
+windows. The default is now 4.6, the 1% point for df=4, measured at 1.25%. **This is coupled to
+`window_samples`** -- df=2 needs 8.6 for the same rate, df=6 only 4.0 -- and both the config comment
+and a test assert the coupling, so the next person to widen the window does not silently make the
+controller trigger-happy.
+
+## 1.4 — Shed whole geographic cells, not a random sample of events
+At max workers with lag still climbing, something must give. Dropping a random fraction of events
+biases *every* cell's aggregate low, and silently: each cell looks plausible and each is wrong.
+Dropping a deterministic hash-selected fraction of cells leaves every surviving cell exactly correct
+and makes the loss enumerable -- the supervisor logs precisely which cells went dark and for how
+long (the burst run shed 1,816 events across 12 named cells). Partial correctness you can describe
+beats uniform corruption you cannot. The hash is stable, so the same cells stay shed for the whole
+episode rather than a different arbitrary slice each batch.
+
+## 1.4 — Scale down when lag is low and flat, not only while it is falling
+Caught by `test_never_exceeds_max_or_drops_below_min`: the first scale-down rule required an actively
+negative slope, so once the system went idle and the slope flattened to zero, the pool stayed at max
+forever. The rule is now "lag below the low-water mark and not growing", which covers both the
+draining case and the settled-idle case.
+
+## 1.4 — A monitor that cannot see must not report zero
+The burst run produced no control actions three times running, because `LagMonitor` reported zero lag
+while the broker showed 17,860. Cause: the monitor's consumer never subscribes to anything, so it
+never refreshes its cached cluster metadata; started before the topic existed, it reported no
+partitions forever, and "no partitions" fell through to `total=0` -- indistinguishable from "keeping
+up perfectly". `consumer.topics()` does not fix it either: it returns fresh metadata without
+installing it in the cache that `partitions_for_topic` reads. Partitions are now discovered through
+the admin client's `describe_topics`, a real request every sample. The deeper lesson is recorded in
+the code as a comment: a health signal whose unknown state renders as its healthy value will hide
+exactly the incident it exists to detect. The supervisor now also logs every sample, not only the
+ones that act, because the three silent runs were undiagnosable without the holds and their reasons.
