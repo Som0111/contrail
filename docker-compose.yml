@@ -105,12 +105,18 @@ services:
 
   generator:
     build: {context: ., target: base}
-    command: >
-      python -m src.ingestor.synthetic --aircraft 40 --rate 2
-      --out-of-order-prob 0.15 --max-skew-s 20 --duplicate-prob 0.03
-      --late-prob 0.01 --drop-prob 0.01
+    # SOURCE=opensky switches this to the live ADS-B feed with no code change.
+    command: python -m src.ingestor.run
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
+      SOURCE: ${SOURCE:-synthetic}
+      GEN_AIRCRAFT: ${GEN_AIRCRAFT:-40}
+      GEN_RATE_HZ: ${GEN_RATE_HZ:-2}
+      CHAOS_OUT_OF_ORDER_PROB: ${CHAOS_OUT_OF_ORDER_PROB:-0.15}
+      CHAOS_MAX_SKEW_S: ${CHAOS_MAX_SKEW_S:-20}
+      CHAOS_DUPLICATE_PROB: ${CHAOS_DUPLICATE_PROB:-0.03}
+      CHAOS_LATE_PROB: ${CHAOS_LATE_PROB:-0.01}
+      CHAOS_DROP_PROB: ${CHAOS_DROP_PROB:-0.01}
     depends_on:
       redpanda: {condition: service_healthy}
     networks: [contrail]

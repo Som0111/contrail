@@ -14,6 +14,14 @@ class Settings(BaseSettings):
     kafka_consumer_group: str = "contrail-sink"
 
     # Synthetic generator. Chaos knobs are config-driven so Phase 1 can sweep them.
+    # Data source: "synthetic" (default, controllable chaos, used for every
+    # benchmark) or "opensky" (real ADS-B, no control over its messiness).
+    source: str = "synthetic"
+    opensky_poll_interval_s: float = 15.0
+    # Central Europe by default. A bounding box costs fewer OpenSky credits than
+    # the whole world and keeps the anonymous daily allowance usable.
+    opensky_bbox: str = "45,5,55,15"
+
     gen_aircraft: int = 50
     gen_rate_hz: float = 1.0
     gen_seed: int = 1337

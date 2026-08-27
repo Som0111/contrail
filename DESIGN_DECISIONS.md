@@ -402,3 +402,45 @@ early warning. Both now derive the icao24 set of the fleet they generate and sco
 counts and duplicate checks to it, which makes them independent of anything else writing. The
 control benchmark got the same treatment, since a demo pipeline writing rows would otherwise pollute
 its latency percentiles.
+
+## 2.4 — OpenSky is a second `EventSource`, not a fork of the publisher
+The protocol defined back in 0.2 (`name` + `stream()`) paid for itself here: `OpenSkySource` is a new
+implementation and nothing downstream changed. `publish()`, the sink, the windowing service, the
+control loop and the API are byte-identical under either source, and `ingestor/run.py` is the only
+module in the codebase that knows two sources exist. A test asserts both satisfy the protocol, so the
+claim is checked rather than asserted in prose.
+
+## 2.4 — Substituted values and invented values are counted separately
+A null `baro_altitude` can be filled from `geo_altitude`, which is a real reading from a different
+sensor. A null `velocity` can only be filled with 0.0, which is a guess. The first draft counted both
+as `repaired_fields`, and a test caught the conflation. They are now `substituted_altitude` and
+`repaired_fields`. The distinction matters operationally: an operator seeing "5% repaired" should
+know whether that means "we used the other altimeter" or "we made a number up", and a single counter
+lets the second hide inside the first. This is the same principle as the late-event side output --
+degraded data stays visible as degraded.
+
+## 2.4 — Live feed messiness is absorbed, never allowed to reach the pipeline as an exception
+Rate limits (429, with or without `Retry-After`), 5xx, connection timeouts and non-JSON bodies all
+return "retry this poll" rather than raising. The poll loop backs off exponentially with jitter and
+resets to the normal interval on the first success, so a single blip does not leave the poller
+permanently slowed. Jitter is not decoration: without it, a fleet of pollers recovering from one
+outage re-synchronises and hammers the API in lockstep. A `Retry-After` header is honoured over our
+own backoff, because the server knows better than we do. Each of these paths has a test with an
+injected failure -- a live feed's failure modes cannot be summoned on demand.
+
+## 2.4 — Duplicates from the live feed are left to the sink, not filtered in the adapter
+OpenSky returns the same aircraft on consecutive polls with an unchanged `time_position` whenever it
+has no newer observation. Those are genuine duplicates of one event. The adapter does not filter
+them: the sink's `(icao24, event_time)` idempotency key already handles exactly this, and filtering
+in two places means two things to keep correct. The live run bore it out -- 26,407 states emitted
+against 22,702 rows stored, roughly 3,700 real duplicates absorbed by a constraint written in
+Phase 0.3 for synthetic data.
+
+## 2.4 — The geographic partition key behaves differently on live data, and that is worth knowing
+Under the default bounding box (central Europe, 10 degrees square), the 5-degree grid yields only
+**four** cells, and traffic concentrates heavily in one of them. The synthetic generator spreads
+aircraft worldwide and fills all six Kafka partitions evenly; the live feed does not. That is not a
+bug in either -- it is what happens when a uniform grid meets a non-uniform world -- but it means
+partition balance measured against synthetic traffic does not transfer to a regional live feed.
+Widening the bbox or shrinking `GRID_DEG` both help; the honest framing is that the partitioning
+scheme is tuned for the synthetic benchmark and would need revisiting for a regional deployment.
