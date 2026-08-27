@@ -80,6 +80,9 @@ services:
   # produces a live system with a populated dashboard rather than an empty one.
   windowing:
     build: {context: ., target: base}
+    # Restarted automatically, as any orchestrator would. Phase 2.5 kills
+    # this process to prove recovery needs no manual intervention.
+    restart: unless-stopped
     command: python -m src.windowing.service
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
@@ -92,8 +95,19 @@ services:
 
   pipeline:
     build: {context: ., target: base}
+    # Restarted automatically, as any orchestrator would. Phase 2.5 kills
+    # this process to prove recovery needs no manual intervention.
+    restart: unless-stopped
     # The adaptive supervisor: sink workers plus the lag controller.
-    command: python -m src.control.supervisor --max-rate 250 --max-workers 4
+    #
+    # Run under a shell, with trailing commands so the shell cannot exec-replace
+    # itself with python. That keeps python a *child* rather than PID 1, which
+    # matters for the Phase 2.5 chaos test: the kernel makes PID 1 in a namespace
+    # immune to signals from inside it, and `docker kill` from outside is treated
+    # as an operator stop so the restart policy is skipped. With python as a child,
+    # killing it is a genuine application crash -- the shell exits non-zero and
+    # the restart policy does what it exists to do.
+    command: sh -c "python -m src.control.supervisor --max-rate 250 --max-workers 4; echo 'supervisor exited'; exit 1"
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
@@ -105,6 +119,9 @@ services:
 
   generator:
     build: {context: ., target: base}
+    # Restarted automatically, as any orchestrator would. Phase 2.5 kills
+    # this process to prove recovery needs no manual intervention.
+    restart: unless-stopped
     # SOURCE=opensky switches this to the live ADS-B feed with no code change.
     command: python -m src.ingestor.run
     environment:

@@ -354,3 +354,74 @@ Four of roughly twenty WebSocket connections time out during the 100-user ramp (
 20 users/second arriving). It is a ramp-rate artefact on a saturated host rather than a steady-state
 failure — no connection dropped once established, and the 20-user run had zero connect failures.
 Not chased further, and recorded here rather than smoothed away by raising the client timeout.
+
+---
+
+# Chaos test — consumer crash under live traffic
+
+**Reproduce:** `BURST_RATE=12 bash scripts/chaos_kill.sh 45`
+
+"Recovered" is defined before the run, not after seeing the result:
+1. consumer group lag returns below 200,
+2. zero duplicate `(icao24, event_time)` rows — idempotency held across the crash,
+3. rows keep accumulating — events published during the outage were not lost.
+
+## Scenario
+
+The adaptive pipeline (sink workers + lag controller) is `SIGKILL`ed while the generator keeps
+producing. Nothing repairs anything: the container's `restart: unless-stopped` policy restarts the
+process and the pipeline is left to sort itself out. The kill is verified by asserting Docker's
+`RestartCount` actually incremented — a chaos test that silently kills nothing and reports PASS is
+worse than no chaos test.
+
+## Result A — crash at baseline load (80 ev/s)
+
+| | |
+|---|---|
+| kill confirmed | `SIGKILLed supervisor pid 7`, RestartCount 0 -> 1 |
+| process back up | ~5 s (restart policy, no manual action) |
+| peak lag | **1** |
+| recovered after | **55 s** from kill |
+| duplicate keys | 0 before, 0 after |
+| rows | 332,764 -> 337,841 (+5,077, never stalled) |
+
+At baseline load the outage is shorter than one poll interval, so lag never leaves single digits.
+True, and not very interesting — which is why the test also runs under burst.
+
+## Result B — crash during a 6x burst (720 ev/s)
+
+| | |
+|---|---|
+| kill confirmed | RestartCount 1 -> 2 |
+| peak lag during outage | **10,524** |
+| controller actions | 7 — `scale_up` at lag 1,823 (slope +192.9/s, t=11.1) and again at 9,430 (+385.6/s, t=11.1) and 10,889, reaching 3 workers; `scale_down` back to 2 once lag hit 1 |
+| lag under sustained burst | drained 10,524 -> ~2,760, then held in a 3,000-4,400 band |
+| after burst ended | drained to 0-34 within ~1 minute; controller released workers |
+| duplicate keys | 0 before, 0 after |
+| rows | 349,245 -> 529,785 (+180,540, never stalled) |
+
+**The lag did not return to zero while the 6x burst continued, and that is the correct behaviour
+rather than a failure.** At 720 ev/s sustained against a 250 ev/s per-worker cap, three workers is
+750 ev/s — barely above the inflow — so the controller stabilised lag in a bounded band instead of
+letting it grow without limit, which is exactly what the shed/scale design is for. Once load returned
+to normal the backlog drained to zero in about a minute and workers were released.
+
+## What this cost the run, and a methodology note
+
+The first attempt reported a false PASS: `docker compose kill` and `kill -9 1` inside the container
+both left the process running or un-restarted, and the script declared success anyway. Two causes,
+both worth knowing:
+
+* The kernel makes PID 1 in a namespace immune to signals sent from *inside* that namespace when it
+  has no handler — `kill -9 1` is silently ignored.
+* `docker kill` from the host does terminate it (exit 137) but Docker treats that as an
+  operator-initiated stop and **skips the restart policy** — `RestartCount` stayed 0.
+
+The fix is to run the supervisor under a shell so python is a child rather than PID 1, then kill the
+child: the shell exits non-zero, which is what an application crash actually looks like, and the
+restart policy does what it exists to do. The script now asserts `RestartCount` incremented before
+believing any of its own numbers.
+
+A second methodology flaw: the first burst run left the 6x load running *through* the recovery
+window, so "recovered" was really asking whether the pipeline can sustain 6x load forever — a
+capacity question, not a recovery one. The burst now ends before the recovery clock starts.
