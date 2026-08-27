@@ -27,6 +27,7 @@ counted and logged, never dropped in silence.
 import argparse
 import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -75,21 +76,35 @@ class WatermarkProcessor:
         self,
         window_s: int = DEFAULT_WINDOW_S,
         allowed_lateness_s: float = DEFAULT_ALLOWED_LATENESS_S,
+        on_finalize: Callable[[WindowAggregate], None] | None = None,
     ) -> None:
+        self.on_finalize = on_finalize
         self.window_s = window_s
         self.allowed_lateness = timedelta(seconds=allowed_lateness_s)
         self._agg = Aggregator()
-        self._max_event_time: datetime | None = None
+        # One high-water mark per source (Kafka partition), with the global
+        # watermark taken as the MINIMUM across them -- what Flink and Beam do.
+        # A single global max is wrong the moment input is partitioned: one
+        # partition running ahead would finalize windows on behalf of partitions
+        # that have not delivered their events yet, and every one of those events
+        # would then be correctly-but-uselessly reported late. Offline replay
+        # sidesteps this by sorting the whole stream first (see collect()); a live
+        # consumer cannot, because it has not seen the whole stream.
+        self._max_by_source: dict[str, datetime] = {}
         self._finalized_before: datetime | None = None  # windows ending at/before this are closed
         self._result = WatermarkResult()
 
     @property
-    def watermark(self) -> datetime | None:
-        if self._max_event_time is None:
-            return None
-        return self._max_event_time - self.allowed_lateness
+    def max_event_time(self) -> datetime | None:
+        return max(self._max_by_source.values(), default=None)
 
-    def process(self, event: FlightState) -> None:
+    @property
+    def watermark(self) -> datetime | None:
+        if not self._max_by_source:
+            return None
+        return min(self._max_by_source.values()) - self.allowed_lateness
+
+    def process(self, event: FlightState, source: str = "") -> None:
         # Duplicate first: a repeat of a late event is a duplicate, not a second
         # late report. Keeps this identical to the naive baseline's dedup.
         if self._agg.seen_before(event):
@@ -117,12 +132,13 @@ class WatermarkProcessor:
         else:
             self._agg.accumulate(window, event)
 
-        self._advance(event.event_time)
+        self._advance(event.event_time, source)
 
-    def _advance(self, event_time: datetime) -> None:
-        """Push the watermark forward and close everything it has passed."""
-        if self._max_event_time is None or event_time > self._max_event_time:
-            self._max_event_time = event_time
+    def _advance(self, event_time: datetime, source: str = "") -> None:
+        """Push this source's high-water mark forward and close what the global one passed."""
+        current = self._max_by_source.get(source)
+        if current is None or event_time > current:
+            self._max_by_source[source] = event_time
         mark = self.watermark
         if mark is None:
             return
@@ -131,11 +147,19 @@ class WatermarkProcessor:
         )
         for window in sorted(self._agg.pending_windows()):
             if window + timedelta(seconds=self.window_s) <= self._finalized_before:
-                self._result.windows.update(self._agg.pop_window(window))
+                finalized = self._agg.pop_window(window)
+                self._result.windows.update(finalized)
+                if self.on_finalize:
+                    for aggregate in finalized.values():
+                        self.on_finalize(aggregate)
 
     def close(self) -> WatermarkResult:
         """End of stream: everything still open is complete by definition."""
-        self._result.windows.update(self._agg.finalize())
+        remaining = self._agg.finalize()
+        self._result.windows.update(remaining)
+        if self.on_finalize:
+            for aggregate in remaining.values():
+                self.on_finalize(aggregate)
         self._result.final_watermark = self.watermark
         return self._result
 

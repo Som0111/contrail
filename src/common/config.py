@@ -38,6 +38,15 @@ class Settings(BaseSettings):
 
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+
+    # Auth + rate limiting. jwt_secret MUST be overridden outside local dev;
+    # the default exists so `docker compose up` works from a clean checkout.
+    jwt_secret: str = "dev-only-change-me"
+    jwt_ttl_s: int = 3600
+    api_user: str = "operator"
+    api_password: str = "contrail"
+    rate_limit_rps: float = 10.0
+    rate_limit_burst: float = 20.0
     log_level: str = "INFO"
 
     @property

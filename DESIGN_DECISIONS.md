@@ -301,3 +301,58 @@ timing *is* the point.
 offsets and hash a *suffix* of the recording while reporting it as the whole thing -- and it would
 do so silently, producing a plausible digest over the wrong data. A fresh group makes "read from
 offset 0" structural rather than something the caller has to remember.
+
+## 2.1 — Per-partition watermarks, finally implemented for the live path
+DESIGN_DECISIONS 1.2 deferred this to "the live windowing service in Phase 2", and 2.1 is that
+service, so it is implemented rather than deferred again. `WatermarkProcessor` now keeps a
+high-water mark per source (Kafka partition) and takes the global watermark as the **minimum** across
+them. A single global max is wrong the moment input is partitioned: one partition running ahead
+finalizes windows on behalf of partitions that have not delivered yet, and every one of their events
+is then correctly-but-uselessly reported late — the exact 33x over-reporting measured in 1.2. Offline
+replay sidesteps it by sorting the whole stream first; a live consumer cannot, because it has not
+seen the whole stream. The default source is `""`, so every existing call site and all the replay
+determinism guarantees are unchanged.
+
+**Not done: idle-partition handling.** A partition that stops delivering never advances its mark, so
+the global minimum stalls and windows stop finalizing. Every partition carries traffic under the
+synthetic load, so this does not bite here, but it is the standard next problem and needs an
+idleness timeout that drops a quiet partition out of the minimum. Deliberately left out because the
+timeout would have to consult the wall clock, and that would put non-determinism into the same
+processor the Phase 1.6 replay claim depends on — it needs to be an opt-in path, not a default.
+
+## 2.1 — Redis is the seam between the pipeline and the API
+The windowing service publishes each finalized window to a Redis channel (for WebSocket fan-out) and
+into a hash keyed by geographic cell (for REST). The API never touches Kafka. Alternative: have the
+API consume Kafka directly, which is fewer moving parts. Rejected because an HTTP process that joins
+a consumer group takes a partition assignment — so scaling the API to two instances would steal
+partitions from the pipeline, and every deploy would trigger a rebalance that stops consumption
+mid-flight. Availability of the read path and correctness of the write path should not be able to
+damage each other, and a pub/sub seam makes that structural rather than a rule someone has to
+remember.
+
+## 2.1 — Token bucket, not a fixed window
+A fixed window lets a client spend a full quota in the last instant of one window and again in the
+first instant of the next: double the intended rate, precisely at the boundary. A token bucket
+cannot be gamed that way because credit accrues continuously. `test_no_boundary_double_spend`
+asserts it directly. Two details the tests forced out: `updated` is not seeded from
+`time.monotonic()` (that made the first `take()` with an injected clock compute a huge negative
+elapsed and empty a full bucket), and the "enough tokens" comparison carries a 1e-9 epsilon because
+elapsed time accumulates in floating point — refilling across two 0.05s hops lands on
+0.9999999999999432, and refusing that is an unfairness that depends on how the caller sliced time.
+
+## 2.1 — `/healthz` is exempt from rate limiting, so it caches instead
+An orchestrator's liveness probe must never be told to back off; a 429 during a traffic burst would
+take a healthy instance out of rotation exactly when it is needed. But exempting it means it can be
+hammered, and each probe opens a real connection to all three dependencies — 60 concurrent requests
+took `/healthz` from 200 to 503, i.e. the probe exhausted the very things it was checking. A 1s TTL
+cache collapses a burst into one round of probes while staying fresh enough for a poll every few
+seconds. Caching a health check is normally a smell; here the alternative is a self-inflicted
+outage, and the TTL is far shorter than any sensible probe interval.
+
+## 2.1 — WebSocket auth is checked before `accept()`
+The token arrives as a query parameter because browsers cannot set headers on a WebSocket handshake.
+It is verified before the socket is accepted, so an unauthenticated client is refused at the
+handshake rather than being allowed to hold an open connection it can never use. The tradeoff is
+that the token can appear in access logs and proxy logs in a way an `Authorization` header would not;
+with a 1-hour TTL and a single operator account that is acceptable here, and the fix if it ever
+matters is a short-lived ticket issued over REST and exchanged at the handshake.

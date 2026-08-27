@@ -169,5 +169,5 @@ def test_watermark_never_runs_ahead_of_max_event_time():
     proc = watermark.WatermarkProcessor(allowed_lateness_s=15.0)
     for e in events:
         proc.process(e)
-        assert proc.watermark <= proc._max_event_time - timedelta(seconds=15.0)
+        assert proc.watermark <= proc.max_event_time - timedelta(seconds=15.0)
     assert proc.close().final_watermark is not None

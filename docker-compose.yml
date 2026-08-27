@@ -79,6 +79,8 @@ services:
       context: .
       target: dev
     profiles: [dev]
+    depends_on:
+      api: {condition: service_healthy}
     volumes:
       - ./src:/app/src
       - ./tests:/app/tests
