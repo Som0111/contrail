@@ -5,7 +5,14 @@ import time
 import jwt
 import pytest
 
-from src.api.auth import RateLimiter, TokenBucket, decode_token, issue_token
+from src.api.auth import (
+    DEV_SECRET,
+    RateLimiter,
+    TokenBucket,
+    decode_token,
+    issue_token,
+    signing_secret,
+)
 from src.common.config import get_settings
 
 
@@ -61,11 +68,10 @@ def test_token_roundtrips_with_subject():
 
 
 def test_expired_token_is_rejected():
-    s = get_settings()
     stale = jwt.encode(
         {"sub": "operator", "iat": int(time.time()) - 7200,
          "exp": int(time.time()) - 3600},
-        s.jwt_secret, algorithm="HS256",
+        signing_secret(), algorithm="HS256",
     )
     with pytest.raises(jwt.ExpiredSignatureError):
         decode_token(stale)
@@ -83,3 +89,21 @@ def test_unsigned_token_is_rejected():
     none_alg = jwt.encode({"sub": "operator"}, key="", algorithm="none")
     with pytest.raises(jwt.PyJWTError):
         decode_token(none_alg)
+
+
+def test_the_committed_placeholder_secret_cannot_sign_a_valid_token():
+    """The placeholder is in git and in .env.example.
+
+    Honouring it would let anyone forge a token against any deployment that never
+    set JWT_SECRET, so an unconfigured API signs with a random per-process key
+    instead.
+    """
+    from src.common.config import get_settings
+
+    assert get_settings().jwt_secret == DEV_SECRET, "this test assumes an unconfigured env"
+    assert signing_secret() != DEV_SECRET, "must not sign with the committed placeholder"
+
+    forged = jwt.encode({"sub": "operator", "exp": int(time.time()) + 600},
+                        DEV_SECRET, algorithm="HS256")
+    with pytest.raises(jwt.InvalidSignatureError):
+        decode_token(forged)

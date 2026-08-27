@@ -444,3 +444,55 @@ bug in either -- it is what happens when a uniform grid meets a non-uniform worl
 partition balance measured against synthetic traffic does not transfer to a regional live feed.
 Widening the bbox or shrinking `GRID_DEG` both help; the honest framing is that the partitioning
 scheme is tuned for the synthetic benchmark and would need revisiting for a regional deployment.
+
+## 2.8 — Long-running services need bounded accumulators; making them permanent was a regression
+Phase 2.2 promoted `windowing`, `pipeline` and `generator` from ad-hoc commands to always-on compose
+services. That silently invalidated an assumption three data structures were written under. The
+dedup set in `Aggregator` even carried a comment saying it was "fine for the bounded replay runs the
+benchmarks use" — which stopped being true the moment the service stopped exiting. Measured at the
+live rate of ~86 events/s: about 7.4 million entries and over a gigabyte a day in that set alone,
+with the finalized-window dict, the late-event list and the controller history growing beside it.
+The windowing service would have run out of memory in roughly a week.
+
+Fixed by making all three bounded **only where boundedness is correct**:
+`seen_retention_windows`, `late_retention` and `retain_windows` all default to unbounded, because
+replay determinism depends on a dedup set that never forgets and the benchmarks depend on keeping
+every window. Only the live service sets them. Eviction is bucketed by the event's own window so it
+costs O(buckets) rather than a scan of millions of keys.
+
+The tradeoff is stated rather than hidden: a duplicate arriving after its bucket is evicted is no
+longer recognised as a duplicate and is reported as a late event instead. Its window closed long
+ago either way, so no aggregate changes — only which counter it lands in. `late_count` is tracked
+separately from the capped list so the total stays exact while only a recent sample is retained.
+
+## 2.8 — The committed JWT placeholder is never honoured as a signing key
+`jwt_secret` defaults to `dev-only-change-me`, which is in git and in `.env.example`, and a code
+comment saying it "MUST be overridden" enforces nothing — anyone could mint a valid token for any
+deployment that never set it. The API now signs with a random per-process secret whenever the
+placeholder is still in use, and warns once. `docker compose up` still works out of the box; the only
+cost is that tokens do not survive a restart, which is the right behaviour for a secret nobody
+configured. A test asserts a token signed with the placeholder is rejected.
+
+## 2.8 — Known limitation: a windowing crash loses in-flight aggregates
+The sink is crash-safe by construction (commit after write, idempotent key) and replay is
+reproducible, but the **windowing service is neither**. It holds partially-accumulated windows in
+memory and auto-commits offsets on a timer, so a crash loses every window that had not yet finalized,
+and the events that would have completed them are already marked consumed. The aggregate for that
+period is then silently incomplete — the exact failure class this project otherwise sets out to
+eliminate.
+
+This was missed until an audit because the Phase 2.5 chaos test kills the *pipeline*, not the
+windowing service, and no test covers a windowing restart. The obvious partial fix is worse than
+nothing: committing manually after each publish means a restart reprocesses from the last commit and
+re-finalizes an already-published window from a fraction of its events, overwriting a correct
+aggregate in Redis with a wrong one. A real fix needs the window state checkpointed alongside the
+offsets — a Flink-style barrier, or writing partial aggregates to Redis and rehydrating on start.
+That is a genuine feature, not a patch, so it is recorded here and in the README rather than
+half-done.
+
+## 2.8 — Every long-running service runs python as a child, not as PID 1
+The Phase 2.5 shell wrapper was applied only to `pipeline`, so `windowing` and `generator` still ran
+python as PID 1 — which the kernel makes immune to signals from inside its own namespace, meaning
+neither could be crash-tested at all and neither would have honoured its restart policy. All three
+now use the same wrapper. Uniformity here is not tidiness: an untestable service is one whose
+recovery behaviour you are guessing at.

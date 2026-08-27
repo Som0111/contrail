@@ -84,7 +84,10 @@ services:
     # Restarted automatically, as any orchestrator would. Phase 2.5 kills
     # this process to prove recovery needs no manual intervention.
     restart: unless-stopped
-    command: python -m src.windowing.service
+    # Same shell wrapper as `pipeline`: keeps python a child rather than PID 1, so
+    # a crash can actually be simulated and the restart policy applies. Without it
+    # this service cannot be chaos-tested at all.
+    command: sh -c "python -m src.windowing.service; echo 'windowing exited'; exit 1"
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
@@ -124,7 +127,7 @@ services:
     # this process to prove recovery needs no manual intervention.
     restart: unless-stopped
     # SOURCE=opensky switches this to the live ADS-B feed with no code change.
-    command: python -m src.ingestor.run
+    command: sh -c "python -m src.ingestor.run; echo 'generator exited'; exit 1"
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       SOURCE: ${SOURCE:-synthetic}

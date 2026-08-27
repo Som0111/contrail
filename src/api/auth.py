@@ -6,6 +6,8 @@ is that protected routes actually reject unauthenticated callers, which the test
 assert rather than assume.
 """
 
+import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 
@@ -16,7 +18,34 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from src.common.config import get_settings
 
 ALGORITHM = "HS256"
+DEV_SECRET = "dev-only-change-me"
 bearer = HTTPBearer(auto_error=False)
+log = logging.getLogger("contrail.api.auth")
+
+# If the committed placeholder secret is still in use, sign with a random one
+# generated at startup instead. The placeholder is in git and in .env.example, so
+# anyone could forge a token for any deployment that never overrode it -- and a
+# comment saying "MUST be overridden" enforces nothing. Falling back to a random
+# secret keeps `docker compose up` working out of the box while making forgery
+# impossible; the only cost is that tokens do not survive a restart, which is
+# correct behaviour for a secret nobody configured.
+_EPHEMERAL_SECRET = secrets.token_urlsafe(48)
+_warned = False
+
+
+def signing_secret() -> str:
+    """The key actually used to sign and verify. Public so tests can use it too."""
+    global _warned
+    configured = get_settings().jwt_secret
+    if configured != DEV_SECRET:
+        return configured
+    if not _warned:
+        log.warning(
+            "JWT_SECRET is unset, using an ephemeral random secret; tokens will "
+            "not survive a restart. Set JWT_SECRET for anything but local dev."
+        )
+        _warned = True
+    return _EPHEMERAL_SECRET
 
 
 def issue_token(subject: str) -> tuple[str, int]:
@@ -24,14 +53,13 @@ def issue_token(subject: str) -> tuple[str, int]:
     now = int(time.time())
     token = jwt.encode(
         {"sub": subject, "iat": now, "exp": now + s.jwt_ttl_s},
-        s.jwt_secret, algorithm=ALGORITHM,
+        signing_secret(), algorithm=ALGORITHM,
     )
     return token, s.jwt_ttl_s
 
 
 def decode_token(token: str) -> dict:
-    s = get_settings()
-    return jwt.decode(token, s.jwt_secret, algorithms=[ALGORITHM])
+    return jwt.decode(token, signing_secret(), algorithms=[ALGORITHM])
 
 
 async def require_auth(

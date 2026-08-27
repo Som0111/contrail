@@ -77,11 +77,20 @@ class WatermarkProcessor:
         window_s: int = DEFAULT_WINDOW_S,
         allowed_lateness_s: float = DEFAULT_ALLOWED_LATENESS_S,
         on_finalize: Callable[[WindowAggregate], None] | None = None,
+        seen_retention_windows: int | None = None,
+        late_retention: int | None = None,
+        retain_windows: bool = True,
     ) -> None:
         self.on_finalize = on_finalize
+        # All three default to unbounded, which is what replay and the benchmarks
+        # need. The live service, which never exits, sets all three -- see
+        # DESIGN_DECISIONS.md 2.8.
+        self.seen_retention_windows = seen_retention_windows
+        self.late_retention = late_retention
+        self.retain_windows = retain_windows
         self.window_s = window_s
         self.allowed_lateness = timedelta(seconds=allowed_lateness_s)
-        self._agg = Aggregator()
+        self._agg = Aggregator(window_s, seen_retention_windows)
         # One high-water mark per source (Kafka partition), with the global
         # watermark taken as the MINIMUM across them -- what Flink and Beam do.
         # A single global max is wrong the moment input is partitioned: one
@@ -92,12 +101,13 @@ class WatermarkProcessor:
         # consumer cannot, because it has not seen the whole stream.
         self._max_by_source: dict[str, datetime] = {}
         self._finalized_before: datetime | None = None  # windows ending at/before this are closed
+        self._late_total = 0
         self._result = WatermarkResult()
 
     @property
     def late_count(self) -> int:
-        """Events sent to the side output so far. Public so metrics need not pry."""
-        return len(self._result.late)
+        """Total events sent to the side output. Exact even when the list is capped."""
+        return self._late_total
 
     @property
     def max_event_time(self) -> datetime | None:
@@ -122,7 +132,11 @@ class WatermarkProcessor:
 
         if self._finalized_before is not None and window_end <= self._finalized_before:
             late = LateEvent(event, window, self._finalized_before)
+            self._late_total += 1
             self._result.late.append(late)
+            if self.late_retention is not None and len(self._result.late) > self.late_retention:
+                # Keep a recent sample for inspection; the count above stays exact.
+                del self._result.late[: -self.late_retention]
             log.warning(
                 "late event past allowed lateness",
                 extra={
@@ -150,10 +164,16 @@ class WatermarkProcessor:
         self._finalized_before = (
             mark if self._finalized_before is None else max(self._finalized_before, mark)
         )
+        if self.seen_retention_windows is not None:
+            self._agg.forget_before(
+                self._finalized_before
+                - timedelta(seconds=self.window_s * self.seen_retention_windows)
+            )
         for window in sorted(self._agg.pending_windows()):
             if window + timedelta(seconds=self.window_s) <= self._finalized_before:
                 finalized = self._agg.pop_window(window)
-                self._result.windows.update(finalized)
+                if self.retain_windows:
+                    self._result.windows.update(finalized)
                 if self.on_finalize:
                     for aggregate in finalized.values():
                         self.on_finalize(aggregate)
@@ -161,7 +181,8 @@ class WatermarkProcessor:
     def close(self) -> WatermarkResult:
         """End of stream: everything still open is complete by definition."""
         remaining = self._agg.finalize()
-        self._result.windows.update(remaining)
+        if self.retain_windows:
+            self._result.windows.update(remaining)
         if self.on_finalize:
             for aggregate in remaining.values():
                 self.on_finalize(aggregate)

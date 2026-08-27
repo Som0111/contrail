@@ -48,9 +48,18 @@ class _Sums:
 class Aggregator:
     """Folds events into (window, geo cell) buckets, dropping repeats on the way in."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self, window_s: int = DEFAULT_WINDOW_S, seen_retention_windows: int | None = None
+    ) -> None:
+        self.window_s = window_s
+        # Retention is None for benchmarks and replay -- an unbounded set is the
+        # only way to guarantee a replay dedups identically however long it is.
+        # A live service sets a window count instead: see forget_before().
+        self.seen_retention_windows = seen_retention_windows
         self._sums: dict[WindowKey, _Sums] = {}
-        self._seen: set[tuple[str, datetime]] = set()
+        # Bucketed by the event's own window so eviction is O(buckets), not a
+        # scan of millions of keys.
+        self._seen: dict[datetime, set[tuple[str, datetime]]] = {}
 
     def seen_before(self, event: FlightState) -> bool:
         """Check *and* mark. True means this event has already been counted.
@@ -60,13 +69,32 @@ class Aggregator:
         event should be dropped as a duplicate, not reported twice in the side
         output.
         """
-        # ponytail: unbounded seen-set, one entry per unique event. Fine for the
-        # bounded replay runs the benchmarks use; bound it by the watermark if
-        # this ever runs as a long-lived service.
-        if event.dedup_key in self._seen:
+        bucket = window_start(event.event_time, self.window_s)
+        keys = self._seen.setdefault(bucket, set())
+        if event.dedup_key in keys:
             return True
-        self._seen.add(event.dedup_key)
+        keys.add(event.dedup_key)
         return False
+
+    def forget_before(self, cutoff: datetime) -> int:
+        """Drop dedup state for windows that closed before `cutoff`.
+
+        Only called when `seen_retention_windows` is set, i.e. by the live
+        service. The tradeoff is explicit: a duplicate arriving after its bucket
+        is evicted is no longer recognised as a duplicate and is reported as a
+        late event instead. Since its window is long finalized either way it
+        would not have changed an aggregate -- only which counter it lands in.
+        In exchange the set stops growing forever, which at the live rate was
+        roughly 7.4 million entries and over a gigabyte a day.
+        """
+        stale = [b for b in self._seen if b < cutoff]
+        for bucket in stale:
+            del self._seen[bucket]
+        return len(stale)
+
+    @property
+    def seen_size(self) -> int:
+        return sum(len(v) for v in self._seen.values())
 
     def accumulate(self, window: datetime, event: FlightState) -> None:
         """Fold an event in without a duplicate check."""
@@ -116,7 +144,7 @@ def ground_truth(
     could attribute a record it never received, so counting drops against them
     would make the comparison meaningless.
     """
-    agg = Aggregator()
+    agg = Aggregator(window_s)
     for event in events:
         agg.add(window_start(event.event_time, window_s), event)
     return agg.finalize()

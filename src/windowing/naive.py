@@ -39,7 +39,7 @@ def aggregate(
     events: list[FlightState], window_s: int = DEFAULT_WINDOW_S
 ) -> dict[WindowKey, WindowAggregate]:
     """Bucket by arrival time. Wrong on purpose."""
-    agg = Aggregator()
+    agg = Aggregator(window_s)
     for event in events:
         agg.add(window_start(event.ingest_time, window_s), event)
     return agg.finalize()

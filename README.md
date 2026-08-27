@@ -156,6 +156,10 @@ downstream knows which source is running. It is the reality check, not the measu
 
 Known limitations, all documented in full in [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md):
 
+- **A windowing-service crash loses in-flight aggregates.** The sink is crash-safe (commit after
+  write, idempotent key) and replay is reproducible, but the windowing service holds partial windows
+  in memory and auto-commits offsets, so a crash leaves the aggregate for that period silently
+  incomplete. Fixing it properly needs checkpointed window state, not a patch. Known and unfixed.
 - **Idle partitions stall the watermark.** With per-partition watermarks the global watermark is the
   minimum across partitions, so a partition that stops delivering halts window finalization. Every
   partition carries traffic under synthetic load, so it does not bite here. The fix needs a

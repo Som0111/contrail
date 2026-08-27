@@ -44,8 +44,9 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://redis:6379/0"
 
-    # Auth + rate limiting. jwt_secret MUST be overridden outside local dev;
-    # the default exists so `docker compose up` works from a clean checkout.
+    # Auth + rate limiting. Leaving jwt_secret at this placeholder makes the API
+    # sign with a random per-process secret instead (see api/auth.py) -- the
+    # placeholder is committed, so honouring it would let anyone forge a token.
     jwt_secret: str = "dev-only-change-me"
     jwt_ttl_s: int = 3600
     api_user: str = "operator"

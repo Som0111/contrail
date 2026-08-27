@@ -171,3 +171,52 @@ def test_watermark_never_runs_ahead_of_max_event_time():
         proc.process(e)
         assert proc.watermark <= proc.max_event_time - timedelta(seconds=15.0)
     assert proc.close().final_watermark is not None
+
+
+def test_dedup_state_is_unbounded_by_default():
+    """Replay and the benchmarks depend on this: dedup must never forget."""
+    events = _generated(ChaosConfig(duplicate_prob=0.1), ticks=600, aircraft=20)
+    proc = watermark.WatermarkProcessor(allowed_lateness_s=5.0)
+    for e in events:
+        proc.process(e)
+    assert proc._agg.seen_size == len({e.dedup_key for e in events})
+
+
+def test_dedup_state_is_bounded_when_retention_is_set():
+    """The live service never exits, so its dedup set has to stop growing.
+
+    Without this the set reached ~7.4M entries and over a gigabyte a day at the
+    live event rate.
+    """
+    events = _generated(ChaosConfig(duplicate_prob=0.1), ticks=1200, aircraft=20)
+    unique = len({e.dedup_key for e in events})
+
+    proc = watermark.WatermarkProcessor(
+        allowed_lateness_s=5.0, seen_retention_windows=3,
+        late_retention=50, retain_windows=False,
+    )
+    for e in events:
+        proc.process(e)
+
+    assert proc._agg.seen_size < unique / 4, "retention must actually evict"
+    assert proc._agg.seen_size > 0, "but not evict everything"
+    # Retained state stays proportional to the retention window, not the run length.
+    assert proc._agg.seen_size < 20 * 60 * 5
+
+    result = proc.close()
+    assert result.windows == {}, "retain_windows=False must not accumulate output"
+    assert len(result.late) <= 50, "late list is capped"
+    assert proc.late_count >= len(result.late), "but the total count stays exact"
+
+
+def test_capping_the_late_list_does_not_corrupt_the_late_count():
+    events = _generated(
+        ChaosConfig(out_of_order_prob=0.3, max_skew_s=MAX_SKEW,
+                    late_prob=0.08, late_delay_s=180.0), ticks=900
+    )
+    full = watermark.aggregate(events, allowed_lateness_s=10.0)
+    capped = watermark.WatermarkProcessor(allowed_lateness_s=10.0, late_retention=10)
+    for e in events:
+        capped.process(e)
+    capped.close()
+    assert capped.late_count == len(full.late) > 10

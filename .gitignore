@@ -11,3 +11,6 @@ data/
 # Build roadmap and session log stay local
 ROADMAP.md
 PROGRESS.md
+
+# Personal working notes, never published
+LOCAL_NOTES.md

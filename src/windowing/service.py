@@ -66,7 +66,13 @@ async def run(
     await consumer.start()
 
     pending: list[WindowAggregate] = []
-    processor = WatermarkProcessor(window_s, allowed_lateness_s, on_finalize=pending.append)
+    # This process never exits, so every accumulator has to be bounded. Without
+    # these three the dedup set alone reached ~7.4M entries and over a gigabyte a
+    # day at the live rate; windows and late events grew alongside it.
+    processor = WatermarkProcessor(
+        window_s, allowed_lateness_s, on_finalize=pending.append,
+        seen_retention_windows=10, late_retention=1000, retain_windows=False,
+    )
     finalized = 0
     reported_late = 0
     loop = asyncio.get_running_loop()
