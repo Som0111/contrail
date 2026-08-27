@@ -28,8 +28,8 @@ engine** — exactly correct, not within tolerance. Worst single window off by 1
 
 The property behind it is testable as an equality: `allowed_lateness >= max arrival skew` implies the
 output is *identical* to ground truth, and error appears only as the bound tightens below the skew.
-Events that miss their window even so are not dropped — they go to a counted, logged side output.
-Under the harshest configuration that is 15,945 silent misfilings by the baseline against **0**.
+Events that miss their window even so are not dropped; they go to a counted, logged side output.
+Under the harshest configuration that is 15,945 unreported misfilings by the baseline against **0**.
 
 ### 2. A lag-trend controller keeps up where a static pool does not
 
@@ -144,8 +144,8 @@ docker compose run --rm tests pytest -q                                         
 
 ## What this is and is not
 
-**The synthetic generator is the primary source, and that is deliberate.** Every benchmark above runs
-against it, because its disorder is *controllable* — out-of-order probability, arrival skew,
+**The synthetic generator is the primary source, and that is a choice, not a shortcut.** Every
+benchmark above runs against it, because its disorder is *controllable* — out-of-order probability, arrival skew,
 duplicate rate, late-arrival delay and drop rate are all configuration, so a claim like "exactly
 correct when the lateness bound covers the skew" can be stated as an equality and tested. You cannot
 do that against a live feed, because you cannot ask the real world for 45 seconds of skew on demand.
@@ -158,8 +158,9 @@ Known limitations, all documented in full in [DESIGN_DECISIONS.md](DESIGN_DECISI
 
 - **A windowing-service crash loses in-flight aggregates.** The sink is crash-safe (commit after
   write, idempotent key) and replay is reproducible, but the windowing service holds partial windows
-  in memory and auto-commits offsets, so a crash leaves the aggregate for that period silently
-  incomplete. Fixing it properly needs checkpointed window state, not a patch. Known and unfixed.
+  in memory and auto-commits offsets, so a crash leaves the aggregate for that period incomplete
+  with nothing to signal it. A proper fix needs checkpointed window state, not a patch. Known and
+  unfixed.
 - **Idle partitions stall the watermark.** With per-partition watermarks the global watermark is the
   minimum across partitions, so a partition that stops delivering halts window finalization. Every
   partition carries traffic under synthetic load, so it does not bite here. The fix needs a

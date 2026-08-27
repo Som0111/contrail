@@ -4,17 +4,17 @@ Non-obvious choices, the alternative considered, and why this one won.
 
 ## 0.1 — `/healthz` probes the real client path, not a TCP dial
 A liveness check that only opens a socket proves the port is bound, not that the dependency is
-usable by the code that matters. Alternative: cheap TCP connect per dependency, which is faster and
-never fails for auth or extension reasons. Rejected because the failure mode we actually care about
-in later phases is "Postgres is up but TimescaleDB isn't loaded" or "broker is up but metadata
+usable by the code that matters. A cheap TCP connect per dependency would be faster and would never
+fail for auth or extension reasons, but it misses the failure mode we actually care about
+in later phases: "Postgres is up but TimescaleDB isn't loaded" or "broker is up but metadata
 fetches hang" — both return green on a TCP dial. So each probe uses the same client library the
 pipeline will use (aiokafka `list_topics`, asyncpg querying `pg_extension` for `timescaledb`,
 redis `PING`), runs concurrently, and is bounded by a 3s timeout so a hung dependency degrades the
 endpoint instead of hanging it.
 
 ## 0.1 — `/healthz` returns 503 when a dependency is down
-Alternative: always 200 with a per-dependency body, letting the caller decide. Rejected because
-Docker Compose healthchecks and any future orchestrator read the status code, not the body. The
+Always returning 200 with a per-dependency body would let the caller decide, but Docker Compose
+healthchecks and any future orchestrator read the status code, not the body. The
 body still carries per-dependency detail for humans; the status code carries the aggregate verdict.
 
 ## 0.2 — Partition by a lat/lon grid cell, not H3
@@ -31,25 +31,25 @@ swap for an H3 call.
 ## 0.2 — Chaos is modelled as arrival delay, never as a corrupted `event_time`
 The generator holds each event in a release heap keyed by `event_time + delay`, so disorder,
 lateness and duplication all come from *when the pipeline sees* an event, while `event_time` stays
-truthful. Alternative considered: perturbing `event_time` directly, which is a one-liner. Rejected
-because it destroys the ground truth — Phase 1.3 has to compare naive and watermark aggregates
+truthful. Perturbing `event_time` directly is a one-liner and was the obvious first idea; it also
+destroys the ground truth — Phase 1.3 has to compare naive and watermark aggregates
 against a known-correct answer, and that answer only exists if `event_time` is never lied about.
-As a bonus, `ingest_time >= event_time` holds by construction, which is a real-world invariant a
+It also means `ingest_time >= event_time` always holds, which is a real-world invariant a
 perturbation model would violate.
 
 ## 0.2 — Pure virtual-clock core, thin real-time shell
 `SyntheticSource.simulate()` is a seeded, synchronous generator over a virtual clock;
 `stream()` is a small async wrapper that paces those same events to wall clock before publishing.
-Alternative: one async generator that sleeps between ticks. Rejected because it would make every
-chaos-rate test take as long as the window it measures — the duplicate/drop-rate tests need 20,000
+A single async generator that sleeps between ticks would be simpler, but then every chaos-rate test
+takes as long as the window it measures — the duplicate/drop-rate tests need 20,000
 events and run in under a second against the pure core. It also hands Phase 1.6 a deterministic
 replay source for free: same seed and same `start_time` produce byte-identical events.
 
 ## 0.2 — One producer interface from the start
 `ingestor/base.py` defines an `EventSource` protocol (`name` + `stream()`) and a `publish()`
 function that knows nothing about which source it is draining. Phase 2.4's OpenSky adapter is a
-second implementation rather than a fork of the publish path. Alternative: write it straight for the
-synthetic source and generalise later. Rejected because the roadmap explicitly depends on the
+second implementation rather than a fork of the publish path. Writing it straight for the synthetic
+source and generalising later is the usual advice, but the roadmap explicitly depends on the
 interface existing now, and it is about six lines.
 
 ## 0.3 — Idempotency key is `(icao24, event_time)`, enforced by the database
@@ -64,10 +64,10 @@ than applied; if that ever matters the fix is `ON CONFLICT ... DO UPDATE`, not a
 
 ## 0.3 — At-least-once delivery, made safe by the write, not by the consumer
 The sink commits offsets only after the batch is durably written, and carries no dedup cache,
-no transactional producer, no exactly-once machinery. Alternative: Kafka transactions for
-end-to-end exactly-once. Rejected as a large amount of coordination to buy a guarantee the unique
-constraint already gives us for one line of SQL, and one that would not survive the pipeline being
-restarted against a fresh consumer group anyway. The crash window this deliberately leaves open —
+no transactional producer, no exactly-once machinery. Kafka transactions would give end-to-end
+exactly-once, at the cost of a great deal of coordination, to buy a guarantee the unique constraint
+already provides in one line of SQL — and one that would not survive the pipeline being restarted
+against a fresh consumer group anyway. The crash window this deliberately leaves open —
 written but not committed — is exercised directly by the kill test, which sees 86-124 records
 re-delivered and absorbed per run.
 
@@ -89,15 +89,15 @@ ids, hiding exactly the relationship an operator is trying to see in the logs.
 `scripts/phase0_report.py` reads the message count from Redpanda's own partition offsets and the
 row count from TimescaleDB, then asserts `stored + suppressed == received`. Alternative: have the
 generator report how many events it emitted and compare against the database. Rejected because the
-generator's intent is not evidence — if the producer silently failed to send, an intent-based report
+generator's intent is not evidence — if the producer failed to send without saying so, an intent-based report
 would still balance. Offsets and rows are two things the pipeline actually did, so the identity only
 holds if the whole path worked. The observable consequence is that `drop_prob` is invisible to the
-report by construction: a dropped event never reaches the topic, so it cannot be counted, only
+report at all: a dropped event never reaches the topic, so it cannot be counted, only
 inferred by comparing against the generator's configured rate.
 
 ## 0.4 — The sink claims the topic's partition count too
 Subscribing a consumer to a missing topic auto-creates it with a single partition. Starting the sink
-before the generator therefore silently capped the pipeline at one partition — caught during the
+before the generator therefore capped the pipeline at one partition, without any error — caught during the
 Phase 0 integration run, when the sink was assigned only `partition=0`. Alternative: turn off broker
 auto-creation, or document a required start order. Rejected both: a documented ordering constraint
 is a trap that fires under Compose restarts, and disabling auto-create turns the mistake into a
@@ -106,9 +106,9 @@ producer does, so whichever starts first creates the topic with the configured p
 
 ## 1.1 — Deduplication is shared by both processors, not left to each
 `Aggregator.add()` drops repeat `(icao24, event_time)` keys, so the naive baseline and the Phase 1.2
-watermark engine both see each event exactly once. Alternative: let the naive processor double-count
-duplicates, since a truly naive implementation would. Rejected because it would inflate naive's
-measured error with a second, unrelated fault, and core claim #1 is specifically about event-time
+watermark engine both see each event exactly once. A truly naive implementation would double-count
+duplicates, and letting it do so was tempting, but that inflates naive's measured error with a
+second, unrelated fault, and core claim #1 is specifically about event-time
 attribution. Keeping dedup identical on both sides means every difference the 1.3 benchmark reports
 is attribution error and nothing else — a smaller, but honest, number.
 
@@ -189,8 +189,8 @@ per-partition watermarks exist, and the README must not imply otherwise.
 
 ## 1.3 — The benchmark replays the seeded generator, not a Kafka topic
 Both processors are pure functions over a list of events in arrival order — exactly what `collect()`
-returns from a real topic — so the transport cannot change their output. Alternative: publish each
-configuration to Redpanda and consume it back, which is more end-to-end. Rejected because it adds
+returns from a real topic — so the transport cannot change their output. Publishing each
+configuration to Redpanda and consuming it back is more end-to-end, but it adds
 broker scheduling and consumer-fetch variance to a measurement of *windowing correctness*, and every
 number would then depend on how the machine happened to schedule that run. The seeded generator makes
 each row reproducible from the config printed beside it, which is the property that matters for a
@@ -244,12 +244,12 @@ which is a *normal* approximation and wrong for a 6-sample window: with 4 degree
 t-distribution has heavy tails, and measurement showed t >= 3.0 firing on 4.62% of pure-noise
 windows. The default is now 4.6, the 1% point for df=4, measured at 1.25%. **This is coupled to
 `window_samples`** -- df=2 needs 8.6 for the same rate, df=6 only 4.0 -- and both the config comment
-and a test assert the coupling, so the next person to widen the window does not silently make the
+and a test assert the coupling, so the next person to widen the window does not quietly make the
 controller trigger-happy.
 
 ## 1.4 — Shed whole geographic cells, not a random sample of events
 At max workers with lag still climbing, something must give. Dropping a random fraction of events
-biases *every* cell's aggregate low, and silently: each cell looks plausible and each is wrong.
+biases *every* cell's aggregate low, and does it invisibly: each cell looks plausible and each is wrong.
 Dropping a deterministic hash-selected fraction of cells leaves every surviving cell exactly correct
 and makes the loss enumerable -- the supervisor logs precisely which cells went dark and for how
 long (the burst run shed 1,816 events across 12 named cells). Partial correctness you can describe
