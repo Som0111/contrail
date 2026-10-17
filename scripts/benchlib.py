@@ -37,7 +37,7 @@ def _image_digests() -> dict[str, str]:
             return {}
         rows = json.loads(out) if out.startswith("[") else [json.loads(x) for x in out.splitlines()]
         return {f"{r.get('ContainerName') or r.get('Service')}": f"{r.get('Repository')}:{r.get('Tag')}@{r.get('ID')}"
-                for r in rows}
+                for r in rows if r is not None}
     except (OSError, subprocess.SubprocessError, ValueError):
         return {}
 
