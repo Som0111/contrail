@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       # .secrets.baseline lists the known dev placeholders (committed on purpose, see
@@ -37,7 +37,7 @@ jobs:
     continue-on-error: ${{ github.event_name == 'pull_request' }}
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Audit locked runtime and dev dependencies
