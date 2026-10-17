@@ -182,7 +182,7 @@ services:
     networks: [contrail]
 
   prometheus:
-    image: prom/prometheus:v3.1.0
+    image: prom/prometheus:v3.15.0
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=6h
