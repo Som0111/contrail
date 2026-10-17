@@ -192,7 +192,7 @@ services:
     networks: [contrail]
 
   grafana:
-    image: grafana/grafana:11.4.0
+    image: grafana/grafana:13.2.4
     environment:
       GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
