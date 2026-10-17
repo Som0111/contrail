@@ -14,7 +14,7 @@ name: contrail
 
 services:
   redpanda:
-    image: redpandadata/redpanda:v24.2.18
+    image: redpandadata/redpanda:v26.2.4
     command:
       - redpanda
       - start
