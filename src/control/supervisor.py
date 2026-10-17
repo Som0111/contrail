@@ -14,7 +14,9 @@ say precisely which cells went dark and for how long.
 
 import argparse
 import asyncio
+import contextlib
 import logging
+import signal
 from dataclasses import dataclass, field
 from hashlib import blake2s
 
@@ -117,6 +119,7 @@ async def supervise(
     config: ControllerConfig, interval_s: float = 2.0,
     duration_s: float | None = None, shed_fraction: float = 0.25,
     max_rate: float | None = None, static_workers: int | None = None,
+    stop: asyncio.Event | None = None,
 ) -> SupervisionResult:
     """Run the monitor -> controller -> pool loop.
 
@@ -137,7 +140,7 @@ async def supervise(
     deadline = None if duration_s is None else loop.time() + duration_s
 
     try:
-        while deadline is None or loop.time() < deadline:
+        while not (stop and stop.is_set()) and (deadline is None or loop.time() < deadline):
             await asyncio.sleep(interval_s)
             sample = await monitor.sample()
             decision = controller.observe(sample)
@@ -223,6 +226,11 @@ async def _main() -> None:
     if args.metrics_port:
         metrics.serve(args.metrics_port)
 
+    stop = asyncio.Event()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError):  # Windows loop; containers are Linux
+            asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+
     if args.static_workers:
         # The 1.5 baseline: same pipeline, no adaptation.
         shed = ShedState()
@@ -231,7 +239,9 @@ async def _main() -> None:
         await pool.scale_to(args.static_workers)
         log.info("static pool running", extra={"workers": args.static_workers})
         try:
-            await asyncio.sleep(args.duration or 3600)
+            await asyncio.wait_for(stop.wait(), timeout=args.duration or 3600)
+        except TimeoutError:
+            pass
         finally:
             await pool.close()
         return
@@ -243,7 +253,7 @@ async def _main() -> None:
             cooldown_s=args.cooldown_s, growth_threshold=args.growth_threshold,
         ),
         interval_s=args.interval, duration_s=args.duration,
-        shed_fraction=args.shed_fraction, max_rate=args.max_rate,
+        shed_fraction=args.shed_fraction, max_rate=args.max_rate, stop=stop,
     )
 
 

@@ -16,7 +16,10 @@ the aircraft was in that state, to the instant the row was durably committed.
 Chaos is off for this benchmark -- injected arrival skew would add a constant to
 both arms and dilute the queueing delay that is actually under test.
 
-Usage:  python -m scripts.benchmark_control [--burst-rate 12] [--max-rate 250]
+Each comparison is repeated (--runs) and reported as median with min/max, and the
+result is saved as JSON together with the commit and machine it ran on.
+
+Usage:  python -m scripts.benchmark_control [--burst-rate 12] [--max-rate 250] [--runs 3]
 """
 
 import argparse
@@ -24,8 +27,16 @@ import asyncio
 import platform
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 
+from scripts.benchlib import (
+    actions_before,
+    resource_snapshot,
+    summarize,
+    time_to_stabilize,
+    write_result,
+)
 from src.common.config import get_settings
 from src.common.logging import configure
 from src.control.controller import ControllerConfig
@@ -60,6 +71,8 @@ class Arm:
     p99: float
     max_latency: float
     static: bool
+    resources: dict = field(default_factory=dict)
+    timing: dict = field(default_factory=dict)
 
 
 async def load(bootstrap: str, topic: str, phases: list[tuple[float, float]],
@@ -101,6 +114,8 @@ async def run_arm(name: str, static_workers: int | None, args) -> Arm:
     # will still be behind, which is the finding.
     duration = args.baseline_s + args.burst_s + args.recovery_s + args.drain_s
 
+    t_start = time.perf_counter()
+    cpu_before = resource_snapshot()["cpu_s"]
     supervisor = asyncio.create_task(
         supervise(
             s.kafka_bootstrap, topic, group, s.postgres_dsn,
@@ -113,8 +128,15 @@ async def run_arm(name: str, static_workers: int | None, args) -> Arm:
         )
     )
     await asyncio.sleep(2.0)  # let the pool join the group before load starts
+    t_load = time.perf_counter()
     published = await load(s.kafka_bootstrap, topic, phases, args.aircraft, args.seed)
+    t_loaded = time.perf_counter()
     supervision = await supervisor
+    t_done = time.perf_counter()
+    snap = resource_snapshot()
+    # CPU is this process only (supervisor and sink workers share it); the broker and
+    # database run in other containers and are not included.
+    resources = {"cpu_s": snap["cpu_s"] - cpu_before, "peak_rss_mb": snap["peak_rss_mb"]}
 
     stored = await timescale.count_events(pool, fleet)
     async with pool.acquire() as conn:
@@ -126,6 +148,11 @@ async def run_arm(name: str, static_workers: int | None, args) -> Arm:
         p50=float(row["p50"] or 0), p95=float(row["p95"] or 0),
         p99=float(row["p99"] or 0), max_latency=float(row["max"] or 0),
         static=static_workers is not None,
+        resources=resources,
+        # startup = supervisor launch to first load; load = the rate schedule;
+        # drain = load end to supervisor exit; teardown/measurement is not in here.
+        timing={"startup_s": t_load - t_start, "load_s": t_loaded - t_load,
+                "drain_s": t_done - t_loaded},
     )
 
 
@@ -167,7 +194,52 @@ def print_arm(arm: Arm) -> None:
         print("    actions applied: none")
 
 
-async def main() -> None:
+def analyze(arm: Arm, args) -> dict:
+    """Everything a run is judged on, as plain numbers (JSON-safe, summarisable)."""
+    sup = arm.supervision
+    interval = args.interval
+    lags = [s.total for s in sup.samples]
+    burst_start = int(args.baseline_s / interval)
+    burst_end = int((args.baseline_s + args.burst_s) / interval)
+    return {
+        "name": arm.name, "static": arm.static,
+        "published": arm.published, "stored": arm.stored,
+        "shed_dropped": sup.shed_dropped,
+        # Published but neither stored nor deliberately shed: still queued when the run
+        # ended, so a non-zero value means the arm had not drained.
+        "undrained": arm.published - arm.stored - sup.shed_dropped,
+        "absorbed_pct": 100 * arm.stored / arm.published if arm.published else 0.0,
+        "peak_lag": sup.peak_lag, "final_lag": sup.final_lag,
+        "time_to_stabilize_s": time_to_stabilize(
+            lags, interval, burst_end, args.recovered_lag),
+        "scale_actions": len(sup.actions),
+        # The first phase is steady baseline load, so any action there is a false trigger.
+        "false_positive_actions": actions_before(sup.decisions, burst_start),
+        "p50_s": arm.p50, "p95_s": arm.p95, "p99_s": arm.p99, "max_s": arm.max_latency,
+        "cpu_s": arm.resources.get("cpu_s"), "peak_rss_mb": arm.resources.get("peak_rss_mb"),
+        "timing_s": arm.timing,
+        "lag_samples": lags,
+        "workers": [d.workers for d in sup.decisions],
+    }
+
+
+# Metrics worth a median-and-spread across repeated runs.
+SUMMARY_KEYS = ("peak_lag", "final_lag", "time_to_stabilize_s", "shed_dropped", "undrained",
+                "absorbed_pct", "scale_actions", "false_positive_actions",
+                "p50_s", "p95_s", "p99_s", "max_s", "cpu_s", "peak_rss_mb")
+
+
+def summarize_arms(analyses: list[dict]) -> dict:
+    out = {}
+    for key in SUMMARY_KEYS:
+        vals = [a[key] for a in analyses if a[key] is not None]
+        out[key] = summarize(vals)
+        # A run that never stabilised has no time to report; say how many, don't drop silently.
+        out[key]["missing"] = len(analyses) - len(vals)
+    return out
+
+
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Benchmark static vs adaptive lag control.")
     p.add_argument("--aircraft", type=int, default=60)
     p.add_argument("--base-rate", type=float, default=2.0)
@@ -182,46 +254,90 @@ async def main() -> None:
     p.add_argument("--cooldown-s", type=float, default=6.0)
     p.add_argument("--interval", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=20260827)
-    args = p.parse_args()
+    p.add_argument("--runs", type=int, default=3,
+                   help="repeat the whole static-vs-adaptive comparison; reported as median and spread")
+    p.add_argument("--static-sizes", default=None,
+                   help="comma-separated pool sizes for the static baseline (default: --min-workers)")
+    p.add_argument("--recovered-lag", type=int, default=200,
+                   help="lag at or below this, sustained, counts as stabilised")
+    p.add_argument("--out-dir", default=None,
+                   help="where to write the JSON result (default benchmarks/results; '-' skips)")
+    return p
 
+
+def static_sizes(args) -> list[int]:
+    return [int(x) for x in args.static_sizes.split(",")] if args.static_sizes else [args.min_workers]
+
+
+async def run_comparison(args, quiet: bool = False) -> list[dict]:
+    """One adaptive arm and one static arm per baseline size, same load. Returns analyses."""
+    analyses = []
+    for size in static_sizes(args):
+        arm = await run_arm(f"STATIC   ({size} worker{'s' if size != 1 else ''}, no controller)", size, args)
+        if not quiet:
+            print_arm(arm)
+        analyses.append(analyze(arm, args))
+    arm = await run_arm(f"ADAPTIVE ({args.min_workers}-{args.max_workers} workers)", None, args)
+    if not quiet:
+        print_arm(arm)
+    analyses.append(analyze(arm, args))
+    return analyses
+
+
+def config_record(args) -> dict:
+    """Everything that defines the workload; also the key a sweep cell is identified by."""
+    return {k: v for k, v in vars(args).items() if k not in ("out_dir",)}
+
+
+async def main() -> None:
+    args = build_parser().parse_args()
     configure("WARNING")  # the arms log per-sample; keep the table readable
 
     print("CONTRAIL — core claim #2: adaptive lag control vs a static pool")
     print("=" * 92)
     base = args.aircraft * args.base_rate
     burst = args.aircraft * args.burst_rate
+    sizes = static_sizes(args)
     print(
         f"{args.aircraft} aircraft | baseline {base:,.0f} ev/s for {args.baseline_s:g}s"
         f" -> BURST {burst:,.0f} ev/s ({args.burst_rate / args.base_rate:g}x) for {args.burst_s:g}s"
         f" -> recovery {base:,.0f} ev/s for {args.recovery_s:g}s"
-        f"\nper-worker cap {args.max_rate:g} ev/s | static arm pinned at {args.min_workers}"
-        f" worker | adaptive arm {args.min_workers}-{args.max_workers} workers"
-        f"\nchaos off | seed {args.seed} | python {platform.python_version()}"
+        f"\nper-worker cap {args.max_rate:g} ev/s | static arm(s) pinned at {sizes}"
+        f" | adaptive arm {args.min_workers}-{args.max_workers} workers"
+        f"\nchaos off | seed {args.seed} | {args.runs} run(s) | python {platform.python_version()}"
     )
 
     started = time.perf_counter()
-    static = await run_arm(f"STATIC   ({args.min_workers} worker, no controller)",
-                           args.min_workers, args)
-    print_arm(static)
-    adaptive = await run_arm(f"ADAPTIVE ({args.min_workers}-{args.max_workers} workers)",
-                             None, args)
-    print_arm(adaptive)
+    runs = []
+    for i in range(args.runs):
+        if args.runs > 1:
+            print(f"\n{'#' * 40} run {i + 1} of {args.runs}")
+        runs.append(await run_comparison(args))
 
-    print(f"\n{'=' * 92}\nHEADLINE")
-    def better(a: float, b: float) -> str:
-        return f"{a / b:.1f}x lower" if b and a > b else "-"
-    print(f"  {'':<16}{'static':>12}{'adaptive':>12}{'':>6}")
-    for label, sv, av in (
-        ("peak lag", static.supervision.peak_lag, adaptive.supervision.peak_lag),
-        ("final lag", static.supervision.final_lag, adaptive.supervision.final_lag),
-        ("p50 latency", static.p50, adaptive.p50),
-        ("p95 latency", static.p95, adaptive.p95),
-        ("p99 latency", static.p99, adaptive.p99),
-        ("max latency", static.max_latency, adaptive.max_latency),
-    ):
-        unit = "" if "lag" in label else "s"
-        print(f"  {label:<16}{sv:>12,.2f}{unit}{av:>11,.2f}{unit}   {better(sv, av)}")
-    print(f"\n  completed in {time.perf_counter() - started:.0f}s\n")
+    by_arm: dict[str, list[dict]] = {}
+    for analyses in runs:
+        for a in analyses:
+            by_arm.setdefault(a["name"], []).append(a)
+    summary = {name: summarize_arms(items) for name, items in by_arm.items()}
+
+    print(f"\n{'=' * 92}\nHEADLINE  (median [min - max] over {args.runs} run(s))")
+    for name, sm in summary.items():
+        print(f"\n  {name}")
+        for key in SUMMARY_KEYS:
+            m = sm[key]
+            if m["n"] == 0:
+                print(f"    {key:<24} never (0 of {args.runs} runs)")
+                continue
+            note = f"  ({m['missing']} run(s) without a value)" if m["missing"] else ""
+            print(f"    {key:<24}{m['median']:>12,.2f}  [{m['min']:,.2f} - {m['max']:,.2f}]{note}")
+    elapsed = time.perf_counter() - started
+    print(f"\n  completed in {elapsed:.0f}s\n")
+
+    if args.out_dir != "-":
+        path = write_result("control", {
+            "config": config_record(args), "runs": runs, "summary": summary, "wall_s": elapsed,
+        }, Path(args.out_dir) if args.out_dir else None)
+        print(f"  result saved to {path}\n")
 
 
 if __name__ == "__main__":

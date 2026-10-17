@@ -220,3 +220,62 @@ def test_capping_the_late_list_does_not_corrupt_the_late_count():
         capped.process(e)
     capped.close()
     assert capped.late_count == len(full.late) > 10
+
+
+def _redelivery(retention):
+    """e1 lands in window A, the stream moves on, then e1 is delivered again."""
+    out = []
+    proc = watermark.WatermarkProcessor(
+        60, 0.0, on_finalize=out.append, seen_retention_windows=retention
+    )
+    e1 = event(offset_s=10, arrival_s=10, altitude_m=1000.0, icao="aaa001")
+    proc.process(e1)
+    proc.process(event(offset_s=130, arrival_s=130, altitude_m=1.0, icao="aaa002"))
+    assert [a.count for a in out] == [1]  # window A closed
+    proc.process(e1)
+    return proc, out
+
+
+def test_redelivery_inside_the_retention_horizon_is_a_duplicate():
+    proc, out = _redelivery(retention=5)
+    assert proc.duplicate_count == 1 and proc.late_count == 0
+    assert [a.count for a in out] == [1]
+
+
+def test_redelivery_after_key_eviction_is_reported_late_and_never_recounted():
+    """The documented policy: past the horizon a repeat is a late event, not a duplicate.
+
+    Its window is closed by then, so the aggregate cannot change either way."""
+    proc, out = _redelivery(retention=1)
+    assert proc.seen_evicted > 0
+    assert proc.duplicate_count == 0 and proc.late_count == 1
+    assert [a.count for a in out] == [1]
+
+
+def test_minimum_retention_is_derived_from_lateness():
+    assert watermark.min_seen_retention_windows(60, 30.0) == 2
+    assert watermark.min_seen_retention_windows(60, 60.0) == 2
+    assert watermark.min_seen_retention_windows(10, 45.0) == 6
+
+
+def test_retention_below_the_lateness_bound_warns(caplog):
+    with caplog.at_level("WARNING", logger="contrail.windowing.watermark"):
+        watermark.WatermarkProcessor(10, 45.0, seen_retention_windows=2)
+        assert "dedup retention" in caplog.text
+        caplog.clear()
+        watermark.WatermarkProcessor(10, 45.0, seen_retention_windows=6)
+        assert caplog.text == ""
+
+
+def test_dedup_memory_is_flat_over_a_sustained_stream():
+    events = _generated(ChaosConfig(duplicate_prob=0.1), ticks=1800, aircraft=20)
+    proc = watermark.WatermarkProcessor(
+        allowed_lateness_s=5.0, seen_retention_windows=3, retain_windows=False, late_retention=10
+    )
+    sizes = []
+    for i, e in enumerate(events):
+        proc.process(e)
+        if i % 2000 == 0:
+            sizes.append(proc.seen_size)
+    settled = sizes[len(sizes) // 3:]
+    assert max(settled) < 1.5 * min(settled), f"dedup set still growing: {sizes}"

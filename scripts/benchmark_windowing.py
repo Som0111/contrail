@@ -34,9 +34,11 @@ import platform
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 from src.ingestor.synthetic import ChaosConfig, SyntheticSource
 from src.windowing import naive, watermark
+from scripts.benchlib import summarize, write_result
 from src.windowing.aggregates import compare, ground_truth, window_start
 
 WINDOW_S = 60
@@ -110,12 +112,15 @@ def lateness_bounds(chaos: ChaosConfig) -> list[float]:
 
 
 def run_level(level: Level, aircraft: int, ticks: int, seed: int) -> list[dict]:
+    t_generate = time.perf_counter()
     events = list(
         SyntheticSource(
             n_aircraft=aircraft, rate_hz=1.0, chaos=level.chaos,
             seed=seed, duration_s=ticks, start_time=EPOCH,
         ).simulate()
     )
+    t_score = time.perf_counter()
+    generate_s = t_score - t_generate
     truth = ground_truth(events, WINDOW_S)
     unique = sum(a.count for a in truth.values())
 
@@ -138,10 +143,40 @@ def run_level(level: Level, aircraft: int, ticks: int, seed: int) -> list[dict]:
             "reported": len(result.late),
         })
 
+    # Stream generation and scoring are timed apart; neither is a throughput claim,
+    # they are recorded so a reader can see what dominated the wall time.
+    score_s = time.perf_counter() - t_score
     for r in rows:
-        r.update(unique=unique, generated=aircraft * ticks,
-                 arrived=len(events), truth_windows=len(truth))
+        r.update(unique=unique, generated=aircraft * ticks, arrived=len(events),
+                 truth_windows=len(truth), generate_s=generate_s, score_s=score_s)
     return rows
+
+
+def row_record(r: dict) -> dict:
+    c = r["cmp"]
+    return {
+        "processor": r["processor"], "bound": r["bound"],
+        "windows_wrong": c.windows_wrong, "windows_total": c.windows_total,
+        "window_error_rate": c.window_error_rate, "worst_count_error": c.worst_count_error,
+        "misplaced": r["misplaced"], "reported": r["reported"],
+        "silent": r["misplaced"] - r["reported"], "unique": r["unique"],
+        "generated": r["generated"], "arrived": r["arrived"],
+    }
+
+
+def headline_row(level: Level, rows: list[dict]) -> dict:
+    """The comparison the README quotes: naive vs the watermark engine at L = max skew."""
+    nv = rows[0]
+    at_skew = [r for r in rows[1:] if r["bound"] == level.chaos.max_skew_s]
+    wm = at_skew[0] if at_skew else rows[1]
+    return {
+        "naive_misplaced_pct": 100 * nv["misplaced"] / nv["unique"],
+        "watermark_misplaced_pct": 100 * wm["misplaced"] / wm["unique"],
+        "naive_windows_wrong_pct": 100 * nv["cmp"].window_error_rate,
+        "watermark_windows_wrong_pct": 100 * wm["cmp"].window_error_rate,
+        "naive_silent": nv["misplaced"],
+        "watermark_silent": wm["misplaced"] - wm["reported"],
+    }
 
 
 def print_level(level: Level, rows: list[dict]) -> None:
@@ -178,6 +213,11 @@ def main() -> None:
     p.add_argument("--aircraft", type=int, default=50)
     p.add_argument("--ticks", type=int, default=1800, help="seconds of event time at 1 Hz")
     p.add_argument("--seed", type=int, default=20260827)
+    p.add_argument("--runs", type=int, default=3,
+                   help="repeat with seeds seed, seed+1, ...; the tables below are the first, "
+                        "the summary is across all")
+    p.add_argument("--out-dir", default=None,
+                   help="where to write the JSON result (default benchmarks/results; '-' skips)")
     args = p.parse_args()
 
     # The engine logs every late event at WARNING; that is right in the pipeline
@@ -188,7 +228,8 @@ def main() -> None:
     print("=" * 104)
     print(
         f"window {WINDOW_S}s | {args.aircraft} aircraft @ 1 Hz | {args.ticks}s of event time"
-        f" | seed {args.seed}\npython {platform.python_version()} on {platform.platform()}"
+        f" | seeds {args.seed}..{args.seed + args.runs - 1} ({args.runs} runs)"
+        f"\npython {platform.python_version()} on {platform.platform()}"
     )
     print(
         "\n'silent' = events placed wrongly with no record of it. The whole point:"
@@ -196,31 +237,66 @@ def main() -> None:
     )
 
     started = time.perf_counter()
-    results, group = {}, None
-    for level in LEVELS:
-        if level.group != group:
-            group = level.group
-            print(f"\n{group} DISORDER" + ("" if group == "BOUNDED" else " (late arrivals no bound can absorb)"))
-            print("-" * 104)
-        rows = run_level(level, args.aircraft, args.ticks, args.seed)
-        results[level.name] = rows
-        print_level(level, rows)
+    runs = []  # (seed, {level name: rows}) per repeat
+    for i in range(args.runs):
+        seed = args.seed + i
+        results, group = {}, None
+        for level in LEVELS:
+            if i == 0 and level.group != group:
+                group = level.group
+                print(f"\n{group} DISORDER" + ("" if group == "BOUNDED" else " (late arrivals no bound can absorb)"))
+                print("-" * 104)
+            rows = run_level(level, args.aircraft, args.ticks, seed)
+            results[level.name] = rows
+            if i == 0:
+                print_level(level, rows)
+        runs.append((seed, results))
 
-    print(f"\n{'=' * 104}\nHEADLINE  (watermark at L = max skew, the operationally sane setting)")
+    results = runs[0][1]
+    print(f"\n{'=' * 104}\nHEADLINE, seed {args.seed}  (watermark at L = max skew, the operationally sane setting)")
     for level in LEVELS:
-        rows = results[level.name]
-        nv = rows[0]
-        at_skew = [r for r in rows[1:] if r["bound"] == level.chaos.max_skew_s]
-        wm = at_skew[0] if at_skew else rows[1]
+        h = headline_row(level, results[level.name])
         print(
-            f"  {level.name:<12} events misplaced "
-            f"{100 * nv['misplaced'] / nv['unique']:6.2f}% -> "
-            f"{100 * wm['misplaced'] / wm['unique']:5.2f}%"
-            f"   |  windows wrong {100 * nv['cmp'].window_error_rate:6.2f}% -> "
-            f"{100 * wm['cmp'].window_error_rate:6.2f}%"
-            f"   |  silent errors {nv['misplaced']:,} -> {wm['misplaced'] - wm['reported']:,}"
+            f"  {level.name:<12} events misplaced {h['naive_misplaced_pct']:6.2f}% -> "
+            f"{h['watermark_misplaced_pct']:5.2f}%"
+            f"   |  windows wrong {h['naive_windows_wrong_pct']:6.2f}% -> "
+            f"{h['watermark_windows_wrong_pct']:6.2f}%"
+            f"   |  silent errors {h['naive_silent']:,} -> {h['watermark_silent']:,}"
         )
-    print(f"\n  completed in {time.perf_counter() - started:.1f}s\n")
+
+    summary = {}
+    if args.runs > 1:
+        print(f"\nACROSS {args.runs} SEEDS  (median [min - max])")
+        for level in LEVELS:
+            per_run = [headline_row(level, r[level.name]) for _, r in runs]
+            summary[level.name] = m = {k: summarize([h[k] for h in per_run]) for k in per_run[0]}
+
+            def fmt(k, m=m):
+                return f"{m[k]['median']:.2f} [{m[k]['min']:.2f} - {m[k]['max']:.2f}]"
+
+            print(f"  {level.name:<12} events misplaced {fmt('naive_misplaced_pct')}% -> "
+                  f"{fmt('watermark_misplaced_pct')}%   |  windows wrong "
+                  f"{fmt('naive_windows_wrong_pct')}% -> {fmt('watermark_windows_wrong_pct')}%")
+
+    elapsed = time.perf_counter() - started
+    print(f"\n  completed in {elapsed:.1f}s\n")
+
+    if args.out_dir != "-":
+        path = write_result("windowing", {
+            "args": vars(args),
+            "levels": {lv.name: {"group": lv.group, "describe": lv.describe(),
+                                 "max_skew_s": lv.chaos.max_skew_s} for lv in LEVELS},
+            "runs": [
+                {"seed": seed,
+                 "levels": {name: [row_record(r) for r in rows] for name, rows in res.items()},
+                 "timing_s": {name: {"generate": rows[0]["generate_s"], "score": rows[0]["score_s"]}
+                              for name, rows in res.items()}}
+                for seed, res in runs
+            ],
+            "summary": summary,
+            "wall_s": elapsed,
+        }, Path(args.out_dir) if args.out_dir else None)
+        print(f"  result saved to {path}\n")
 
 
 if __name__ == "__main__":

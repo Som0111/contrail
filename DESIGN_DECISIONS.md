@@ -320,6 +320,12 @@ idleness timeout that drops a quiet partition out of the minimum. Deliberately l
 timeout would have to consult the wall clock, and that would put non-determinism into the same
 processor the Phase 1.6 replay claim depends on — it needs to be an opt-in path, not a default.
 
+**Status update.** Implemented as that opt-in path: `WatermarkProcessor(idle_timeout_s=...)`, default
+`None`, in which case the clock is never read (a test asserts it). The timeout must exceed the lateness
+bound, an injectable clock keeps the tests free of sleeps, and a source that resumes after being
+excluded rejoins with the mark it had, its events for already-closed windows going to the late side
+output. A partition that has never delivered is still not tracked.
+
 ## 2.1 — Redis is the seam between the pipeline and the API
 The windowing service publishes each finalized window to a Redis channel (for WebSocket fan-out) and
 into a hash keyed by geographic cell (for REST). The API never touches Kafka. Alternative: have the
@@ -465,6 +471,16 @@ longer recognised as a duplicate and is reported as a late event instead. Its wi
 ago either way, so no aggregate changes — only which counter it lands in. `late_count` is tracked
 separately from the capped list so the total stays exact while only a recent sample is retained.
 
+### Dedup guarantee, stated precisely
+The live service deduplicates within a rolling event-time horizon: a key is kept until its window is
+`seen_retention_windows` windows behind the closed frontier. The service uses
+`max(10, ceil(allowed_lateness_s / window_s) + 1)`, so the horizon can never fall below the lateness
+bound. Eviction can never double-count an aggregate (any retention of at least one window keeps the key
+while its window is open); what lies past the horizon is only *classification* -- a redelivery is then
+reported as a late event instead of a duplicate, and its closed window is untouched. Unit tests pin both
+behaviours. Replay and benchmarks pass `None`, which stays unbounded. Exposed as
+`contrail_dedup_keys`, `contrail_dedup_evicted_total` and `contrail_dedup_suppressed_total`.
+
 ## 2.8 — The committed JWT placeholder is never honoured as a signing key
 `jwt_secret` defaults to `dev-only-change-me`, which is in git and in `.env.example`, and a code
 comment saying it "MUST be overridden" enforces nothing — anyone could mint a valid token for any
@@ -489,6 +505,23 @@ aggregate in Redis with a wrong one. A real fix needs the window state checkpoin
 offsets — a Flink-style barrier, or writing partial aggregates to Redis and rehydrating on start.
 That is a genuine feature, not a patch, so it is recorded here and in the README rather than
 half-done.
+
+**Status update.** A narrower fix than checkpointed window state was then implemented, avoiding the
+trap above. Offsets are committed manually, and only up to the oldest record that still sits in an
+open window (`src/windowing/offsets.py`), so a restart rebuilds open windows from replay. The
+re-finalization hazard is closed on the Redis side: publishing is a compare-and-set that refuses an
+aggregate older than, or smaller than, what the cell already holds. It does not make delivery
+exactly-once.
+
+The integration test (`tests/integration/test_windowing_recovery.py`) found a second hazard that no
+unit test would have: on restart the partitions replay at different speeds, and the watermark is the
+minimum over only the partitions *heard from so far*, so the first partition to deliver advanced it
+and closed windows the others' backlog still belonged to (events then correctly but uselessly
+reported late). The fix is `WatermarkProcessor(await_sources=...)`: the service names the partitions
+that have a backlog at start, and the watermark holds until each has delivered (or timed out when
+`IDLE_TIMEOUT_S` is set). A fresh start has no backlog, so live behaviour is unchanged. Two
+mutations confirm the test has teeth: removing `await_sources` or committing naively after each
+publish both fail it (the latter counting 31 of 60 events in a window). Scope: one kill, one stream.
 
 ## 2.8 — Every long-running service runs python as a child, not as PID 1
 The Phase 2.5 shell wrapper was applied only to `pipeline`, so `windowing` and `generator` still ran

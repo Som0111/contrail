@@ -14,3 +14,7 @@ PROGRESS.md
 
 # Personal working notes, never published
 LOCAL_NOTES.md
+
+# CI test reports
+tests/junit-*.xml
+compose-logs.txt

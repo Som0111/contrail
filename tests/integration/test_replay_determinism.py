@@ -12,8 +12,10 @@ import sys
 import uuid
 from datetime import UTC, datetime
 
+import pytest
+
 from src.common.config import get_settings
-from src.ingestor.base import ensure_topic, publish_events
+from src.ingestor.base import IncompleteStream, ensure_topic, publish_events
 from src.ingestor.synthetic import ChaosConfig, SyntheticSource
 from src.replay import harness
 from src.windowing.aggregates import WindowAggregate
@@ -68,10 +70,14 @@ async def test_replay_survives_being_killed_mid_stream():
     cmd = [sys.executable, "-m", "src.replay.harness",
            "--topic", topic, "--runs", "1", "--json"]
 
-    # Start it, let it get properly into the stream, then kill it hard.
-    victim = await asyncio.create_subprocess_exec(*cmd, cwd="/app", env=env)
-    await asyncio.sleep(3.0)
-    assert victim.returncode is None, "replay finished before it could be killed"
+    # --announce prints STREAMING once records are flowing and then holds there,
+    # so the kill lands mid-stream by construction rather than after a guessed sleep.
+    victim = await asyncio.create_subprocess_exec(
+        *cmd, "--announce", cwd="/app", env=env, stdout=asyncio.subprocess.PIPE
+    )
+    line = await asyncio.wait_for(victim.stdout.readline(), timeout=60)
+    assert line.strip() == b"STREAMING"
+    assert victim.returncode is None
     victim.kill()
     await victim.wait()
     assert victim.returncode != 0
@@ -132,3 +138,24 @@ async def test_replay_is_insensitive_to_partition_interleaving():
         digests.append(result.digest)
 
     assert digests[0] == digests[1], "partition count leaked into the aggregate"
+
+
+async def test_replay_fails_rather_than_hash_a_prefix():
+    """A deadline too short to reach the end offsets must raise, not return a digest."""
+    topic, _ = await recording()
+    with pytest.raises(IncompleteStream):
+        await harness.replay(SETTINGS.kafka_bootstrap, topic, duration_s=0.0)
+
+
+async def test_replay_of_empty_topic_fails():
+    topic = f"replay.empty.{uuid.uuid4().hex[:8]}"
+    await ensure_topic(SETTINGS.kafka_bootstrap, topic, 3)
+    with pytest.raises(IncompleteStream):
+        await harness.replay(SETTINGS.kafka_bootstrap, topic)
+
+
+async def test_result_records_what_was_hashed():
+    topic, published = await recording()
+    r = await harness.replay(SETTINGS.kafka_bootstrap, topic, window_s=10, allowed_lateness_s=30.0)
+    assert (r.window_s, r.allowed_lateness_s) == (10, 30.0)
+    assert sum(r.end_offsets.values()) == published

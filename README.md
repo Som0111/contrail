@@ -31,6 +31,8 @@ output is *identical* to ground truth, and error appears only as the bound tight
 Events that miss their window even so are not dropped; they go to a counted, logged side output.
 Under the harshest configuration that is 15,945 unreported misfilings by the baseline against **0**.
 
+*Evidence:* `python -m scripts.benchmark_windowing`, [BENCHMARKS.md](BENCHMARKS.md#claim-1--event-time-windowing-vs-a-processing-time-baseline). Single run on the machine in BENCHMARKS.md, recorded before commit SHAs and image digests were captured; the benchmark now repeats runs and saves them (see "Method and what is saved").
+
 ### 2. A lag-trend controller keeps up where a static pool does not
 
 Same 6x burst run twice — once with the pool pinned, once adaptive. Both arms run the controller and
@@ -51,6 +53,8 @@ The controller acts on the *trend* in lag, not a threshold, and requires that tr
 statistically distinguishable from noise before acting — an earlier version scaled up three times and
 shed on a flat, noisy lag series. See [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) §1.4.
 
+*Evidence:* `python -m scripts.benchmark_control`, [BENCHMARKS.md](BENCHMARKS.md#claim-2--adaptive-lag-control-vs-a-static-worker-pool). Single run on the machine in BENCHMARKS.md, recorded before commit SHAs and image digests were captured; the benchmark now repeats runs and saves them (see "Method and what is saved"). The static arm is pinned at one worker, not the strongest fixed pool.
+
 ### 3. Replay is deterministic, including across a crash
 
 | check | result |
@@ -64,6 +68,29 @@ A replay is a pure function of the recorded topic, so a crash costs progress and
 is no partial state to reconcile. Paired with the sink's database-enforced idempotency (a `SIGKILL`ed
 consumer restarts and lands on the exact unique row count, zero duplicates), the pipeline is
 crash-safe at both ends: **writes are idempotent, reads are reproducible.**
+
+*Evidence:* `pytest tests/integration/test_replay_determinism.py` and the sink SIGKILL test in `tests/integration/test_sink_idempotency.py`, [BENCHMARKS.md](BENCHMARKS.md#claim-3--deterministic-replay). This is about replay and the sink; it says nothing about live window-state recovery, which the table below keeps separate.
+
+---
+
+## Guarantees and non-guarantees
+
+| property | status | what backs it |
+|---|---|---|
+| sink writes are idempotent (no duplicate rows after a crash or replay) | **yes** | database unique key; SIGKILL integration test |
+| window output is exact when `allowed_lateness >= max arrival skew` | **yes** | claim 1; unit tests assert the equality |
+| replay of a sealed recording is deterministic | **yes** | claim 3; an incomplete or empty recording now fails instead of hashing a suffix |
+| delivery to Redis | **at-least-once**, not exactly-once | offsets commit after publish; a stale window never overwrites a larger one |
+| live crash recovery of window state | **yes, in the tested scenario** | offsets commit only up to the oldest open window; `test_windowing_recovery.py` kills the service (SIGKILL and SIGTERM) mid-stream, restarts it, and checks every window against ground truth. It fails if offsets are committed naively (31 of 60 events counted) or if the restart does not wait for its backlog partitions |
+| a silent partition does not stall windows | **opt-in** (`IDLE_TIMEOUT_S`), off by default | unit tests; with it off, one idle partition stalls finalization |
+| duplicate suppression | within a rolling event-time horizon only | past it a repeat is counted late, never double counted |
+| behaviour under overload | bounded lag by **deliberately dropping events** (claim 2b) | one overload point, one run |
+| WebSocket delivery | **best-effort**; reconcile via the snapshot or `GET /api/windows` | by design of Redis pub/sub |
+| poison records in the sink | quarantined to a dead-letter table, the rest of the batch lands, replays do not duplicate them | integration test with an unparseable and a contract-violating record |
+| security | login throttling, strict config checks, non-root images | **no** TLS, per-user accounts, or rate limits shared across replicas |
+
+Operating notes, configuration reference and per-service recovery behaviour are in
+[docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ---
 
@@ -80,9 +107,9 @@ flowchart LR
     PUB --> RP[("Redpanda<br/>flight.events.raw<br/>6 partitions, keyed by geo cell")]
 
     RP --> SINK["sink workers<br/>at-least-once"]
-    RP --> WIN["windowing service<br/>per-partition watermarks"]
+    RP --> WIN["windowing service<br/>per-partition watermarks<br/>commits offsets only past open windows"]
 
-    SINK --> TS[("TimescaleDB<br/>hypertable<br/>UNIQUE(icao24, event_time)")]
+    SINK --> TS[("TimescaleDB<br/>hypertable<br/>UNIQUE(icao24, event_time)<br/>+ dead-letter table")]
     WIN --> RD[("Redis<br/>pub/sub + latest per cell")]
 
     LAG["lag monitor"] -->|consumer lag| CTL["controller<br/>trend, not threshold"]
@@ -104,18 +131,20 @@ scaling it cannot steal partitions from the pipeline.
 
 ---
 
-## Quickstart
+## Local demo
 
 ```bash
 docker compose up -d          # everything, including a live self-demonstrating pipeline
 ```
+
+This is a **demo configuration**: default credentials, an anonymous Grafana, no TLS. Its ports for the broker, databases, Prometheus and Grafana bind to loopback; the API listens on all interfaces. Do not expose it as is; see [Production deployment](#production-deployment).
 
 That brings up Redpanda, TimescaleDB, Redis, the API, the windowing service, the adaptive pipeline,
 a synthetic generator, Prometheus and Grafana.
 
 | what | where |
 |---|---|
-| Grafana dashboard | http://localhost:3000 (anonymous viewer) |
+| Grafana dashboard | http://localhost:3000 (anonymous viewer, loopback only) |
 | Prometheus | http://localhost:9090 |
 | API health | http://localhost:8000/healthz |
 | API docs | http://localhost:8000/docs |
@@ -130,6 +159,16 @@ curl -s localhost:8000/api/windows -H "Authorization: Bearer $TOKEN" | jq
 SOURCE=opensky docker compose up -d generator
 ```
 
+### WebSocket delivery is best-effort
+
+`/ws/windows?token=<jwt>` streams finalized windows from Redis pub/sub, which keeps nothing for a
+client that is not connected. A client that was away, too slow, or past its token's expiry has missed
+messages. Right after subscribing it receives `{"type": "snapshot", "windows": [...]}` (the latest
+window per cell, same as `GET /api/windows`), then `window` messages and idle `heartbeat`s. After any
+reconnect treat the snapshot, or `GET /api/windows`, as the truth and key live messages on
+`(window_start, partition_key)`. The server closes with 1008 when the token expires and 1011 when
+Redis fails or the client cannot keep up (5 s send timeout); reconnect with a fresh token.
+
 ### Reproducing the claims
 
 ```bash
@@ -139,6 +178,22 @@ docker compose run --rm tests pytest -q tests/integration/test_replay_determinis
 BURST_RATE=12 bash scripts/chaos_kill.sh 45                                     # chaos test
 docker compose run --rm tests pytest -q                                         # full suite
 ```
+
+## Production deployment
+
+The gap between the demo and a real deployment is configuration, and none of it needs reading the
+source. The short version, with the full table and every variable in
+[docs/OPERATIONS.md](docs/OPERATIONS.md):
+
+- Set `APP_ENV=production`. The API then **refuses to start** on the default `API_PASSWORD`, the
+  placeholder `JWT_SECRET`, or a secret shorter than 32 characters.
+- Keep the broker, database and dashboard ports on loopback (`BIND_HOST`), terminate TLS in front of
+  the API, and set `TRUSTED_PROXY_HOPS` to the number of proxies so rate limits see real client addresses.
+- Set `IDLE_TIMEOUT_S` if a partition can go quiet, and `RETENTION_DAYS` so the events table is bounded.
+- `docker compose down -v` deletes the database volume.
+
+Not provided: TLS, per-user accounts, rate limits shared between API replicas, high availability for
+Redpanda, TimescaleDB or Redis.
 
 ---
 
@@ -156,15 +211,24 @@ downstream knows which source is running. It is the reality check, not the measu
 
 Known limitations, all documented in full in [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md):
 
-- **A windowing-service crash loses in-flight aggregates.** The sink is crash-safe (commit after
-  write, idempotent key) and replay is reproducible, but the windowing service holds partial windows
-  in memory and auto-commits offsets, so a crash leaves the aggregate for that period incomplete
-  with nothing to signal it. A proper fix needs checkpointed window state, not a patch. Known and
-  unfixed.
-- **Idle partitions stall the watermark.** With per-partition watermarks the global watermark is the
-  minimum across partitions, so a partition that stops delivering halts window finalization. Every
-  partition carries traffic under synthetic load, so it does not bite here. The fix needs a
-  wall-clock idleness timeout, which would put non-determinism into the processor claim 3 depends on.
+- **Windowing crash recovery is tested in one scenario, not in general.** The service used to
+  auto-commit offsets, so a crash lost every window that had not finalized. It now commits only up to
+  the oldest record still in an open window, republishes idempotently (a stale or smaller window never
+  overwrites a larger one), and on restart waits for every partition that has a backlog before the
+  watermark moves (otherwise the partition that replays first closes windows the others still
+  belong to; the test caught exactly that). The integration test kills the service once, at one point
+  in one synthetic stream, and checks every window; that is evidence, not a proof. Delivery to Redis
+  is at-least-once, never exactly-once, and the late-event total can double count replayed records
+  after a recovery.
+- **The latest-per-cell hash in Redis only moves forward in event time.** That is what makes a replay
+  harmless, and it also means data whose event time is older than what a cell already holds (a
+  recording replayed through the live service, a clock that steps back) is silently not published for
+  that cell until the key is cleared.
+- **Idle partitions stall the watermark unless `IDLE_TIMEOUT_S` is set.** The global watermark is the
+  minimum across partitions, so a partition that stops delivering halts finalization. The timeout
+  that drops it out of the minimum is opt-in and off by default, because it reads the wall clock and
+  claim 3's determinism depends on that processor being clock-free (replay never sets it). A partition
+  that has never delivered an event is not tracked even when it is set.
 - **Live data concentrates in four geographic cells** under the default bounding box, so partition
   balance measured on worldwide synthetic traffic does not transfer to a regional live feed.
 - **Load shedding is measured separately, at a two-worker cap** (claim 2b in BENCHMARKS.md), because
@@ -192,5 +256,7 @@ ops/             Prometheus config, Grafana provisioning + dashboard JSON
 
 - [DESIGN_DECISIONS.md](DESIGN_DECISIONS.md) — every non-obvious choice, the alternative considered,
   and why it lost. Including the ones that were wrong first.
+- [docs/OPERATIONS.md](docs/OPERATIONS.md) — production checklist, configuration reference, delivery
+  semantics and per-service recovery behaviour.
 - [BENCHMARKS.md](BENCHMARKS.md) — every number above, with the exact configuration and machine that
   produced it.

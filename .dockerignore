@@ -1,0 +1,22 @@
+# Keep the build context small and keep local state out of images.
+.git
+.github
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.ruff_cache
+.venv
+venv
+node_modules
+*.egg-info
+data
+# Local notes and generated reports never belong in an image.
+LOCAL_NOTES.md
+PROGRESS.md
+ROADMAP.md
+tests/junit-*.xml
+compose-logs.txt

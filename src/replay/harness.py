@@ -37,12 +37,13 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 
 from src.common.config import get_settings
 from src.common.logging import configure
-from src.ingestor.base import collect, publish_events
+from src.ingestor.base import collect_sealed, publish_events
 from src.ingestor.synthetic import ChaosConfig, SyntheticSource
 from src.windowing import watermark
 from src.windowing.aggregates import DEFAULT_WINDOW_S, WindowAggregate, WindowKey
@@ -77,6 +78,12 @@ class ReplayResult:
     late: int
     duplicates: int
     digest: str
+    # What the digest is a digest *of*: two digests are comparable only when all
+    # of these match. end_offsets maps partition -> offset the recording was
+    # sealed at.
+    window_s: int
+    allowed_lateness_s: float
+    end_offsets: dict[int, int]
 
 
 async def record(
@@ -103,16 +110,19 @@ async def replay(
     window_s: int = DEFAULT_WINDOW_S,
     allowed_lateness_s: float = DEFAULT_LATENESS_S,
     duration_s: float = 120.0,
-    idle_timeout_s: float = 4.0,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
 ) -> ReplayResult:
     """Read the recording from offset 0 and window it. Pure function of the topic.
 
-    A fresh consumer group every time, deliberately: a replay must not be able to
-    resume from someone else's committed offsets, or it would hash a suffix of
-    the stream rather than the stream.
+    The topic is sealed at its current end offsets (see `collect_sealed`): if it
+    cannot be read to that point within `duration_s` this raises `IncompleteStream`
+    instead of hashing a prefix. Replay a topic after `record()` has returned; one
+    still being written to is replayed as of the instant of the call.
+
+    No consumer group is used, so a replay cannot resume from someone else's
+    committed offsets and hash a suffix of the stream.
     """
-    group = f"replay-{uuid.uuid4().hex[:12]}"
-    events = await collect(bootstrap, topic, group, duration_s, idle_timeout_s)
+    events, end_offsets = await collect_sealed(bootstrap, topic, duration_s, on_progress=on_progress)
     result = watermark.aggregate(events, window_s, allowed_lateness_s)
     return ReplayResult(
         events=len(events),
@@ -120,6 +130,9 @@ async def replay(
         late=len(result.late),
         duplicates=result.duplicates,
         digest=digest(result.windows),
+        window_s=window_s,
+        allowed_lateness_s=allowed_lateness_s,
+        end_offsets=end_offsets,
     )
 
 
@@ -136,6 +149,8 @@ async def _main() -> None:
     p.add_argument("--window-s", type=int, default=s.window_s)
     p.add_argument("--allowed-lateness-s", type=float, default=s.allowed_lateness_s)
     p.add_argument("--json", action="store_true", help="emit only the final result as JSON")
+    p.add_argument("--announce", action="store_true",
+                   help="print STREAMING once records are flowing (lets tests kill mid-stream)")
     args = p.parse_args()
     configure("WARNING" if args.json else s.log_level)
 
@@ -145,7 +160,17 @@ async def _main() -> None:
 
     results = []
     for i in range(args.runs):
-        r = await replay(args.bootstrap, topic, args.window_s, args.allowed_lateness_s)
+        announced = False
+
+        async def progress(_n: int) -> None:
+            nonlocal announced
+            if args.announce and not announced:
+                announced = True
+                print("STREAMING", flush=True)
+                await asyncio.sleep(3600)  # hold mid-stream until the caller kills us
+
+        r = await replay(args.bootstrap, topic, args.window_s, args.allowed_lateness_s,
+                         on_progress=progress)
         results.append(r)
         if not args.json:
             print(f"  run {i + 1}: {r.events:,} events -> {r.windows:,} windows, "

@@ -10,5 +10,7 @@ scrape_configs:
     static_configs: [{targets: ["api:8000"], labels: {component: api}}]
   - job_name: windowing
     static_configs: [{targets: ["windowing:9100"], labels: {component: windowing}}]
+  - job_name: generator
+    static_configs: [{targets: ["generator:9100"], labels: {component: generator}}]
   - job_name: pipeline
     static_configs: [{targets: ["pipeline:9100"], labels: {component: pipeline}}]

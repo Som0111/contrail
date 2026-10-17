@@ -7,7 +7,6 @@ mocked one.
 
 import asyncio
 import json
-import uuid
 from datetime import UTC, datetime
 
 import httpx
@@ -19,6 +18,7 @@ from src.common.config import get_settings
 from src.ingestor.base import ensure_topic, publish_events
 from src.ingestor.synthetic import ChaosConfig, SyntheticSource
 from src.windowing import service
+from tests.helpers import unique
 
 SETTINGS = get_settings()
 BASE = "http://api:8000"
@@ -77,16 +77,17 @@ async def test_websocket_refuses_a_bad_token_at_the_handshake():
 
 async def test_websocket_and_rest_deliver_a_finalized_window():
     """End to end: publish -> windowing service -> Redis -> API -> client."""
-    topic = f"api.test.{uuid.uuid4().hex[:8]}"
-    group = f"api-test-{uuid.uuid4().hex[:8]}"
+    topic, group = unique("api.test"), unique("api-test")
     await ensure_topic(SETTINGS.kafka_bootstrap, topic, SETTINGS.kafka_partitions)
 
-    stop = asyncio.Event()
+    stop, ready = asyncio.Event(), asyncio.Event()
     svc = asyncio.create_task(service.run(
         SETTINGS.kafka_bootstrap, topic, group, SETTINGS.redis_url,
-        window_s=60, allowed_lateness_s=5.0, poll_timeout_ms=250, stop=stop,
+        window_s=60, allowed_lateness_s=5.0, poll_timeout_ms=250, stop=stop, ready=ready,
     ))
-    await asyncio.sleep(3.0)  # the service reads from `latest`, so let it join first
+    # The service reads from `latest`, so it must have joined and positioned before
+    # anything is published. Waiting on the signal, not a guessed delay.
+    await asyncio.wait_for(ready.wait(), timeout=60)
 
     tok = await token()
     async with websockets.connect(f"{WS_BASE}/ws/windows?token={tok}") as ws:

@@ -12,42 +12,63 @@ from hashlib import blake2s
 
 import asyncpg
 
+from src.common.config import get_settings
 from src.common.models import FlightState
 
 log = logging.getLogger("contrail.storage")
 
-SCHEMA = """
-CREATE EXTENSION IF NOT EXISTS timescaledb;
+# One statement per entry, run in order inside a single transaction by ensure_schema().
+# Every step is idempotent, so it is safe on a fresh database, on one created by an
+# older version (no processed_at, no dead-letter table) and when re-run.
+SCHEMA_STEPS = [
+    """
+    CREATE TABLE IF NOT EXISTS flight_events (
+        event_time    TIMESTAMPTZ      NOT NULL,
+        icao24        TEXT             NOT NULL,
+        callsign      TEXT             NOT NULL,
+        lat           DOUBLE PRECISION NOT NULL,
+        lon           DOUBLE PRECISION NOT NULL,
+        altitude_m    DOUBLE PRECISION NOT NULL,
+        velocity_ms   DOUBLE PRECISION NOT NULL,
+        heading       DOUBLE PRECISION NOT NULL,
+        ingest_time   TIMESTAMPTZ      NOT NULL,
+        partition_key TEXT             NOT NULL,
+        trace_id      TEXT             NOT NULL,
+        -- Stamped by the database at write time, so end-to-end latency
+        -- (event_time -> durably stored) is a property of the row, not of whatever
+        -- clock the benchmark script happens to read.
+        processed_at  TIMESTAMPTZ      NOT NULL DEFAULT now(),
+        -- Idempotency key. A hypertable's unique index must include the
+        -- partitioning column, which event_time already is.
+        UNIQUE (icao24, event_time)
+    )
+    """,
+    # For tables created before processed_at existed; a no-op on a fresh one.
+    "ALTER TABLE flight_events ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    "SELECT create_hypertable('flight_events', 'event_time', if_not_exists => TRUE)",
+    # NOTE: no query in src/ filters on partition_key, so nothing currently reads this
+    # index; see scripts/explain_queries.py before relying on it or dropping it.
+    """
+    CREATE INDEX IF NOT EXISTS flight_events_partition_idx
+        ON flight_events (partition_key, event_time DESC)
+    """,
+    # Records the sink could not parse or the database permanently rejected. Keyed by
+    # Kafka position so a replayed batch quarantines the same record only once.
+    """
+    CREATE TABLE IF NOT EXISTS flight_events_dead (
+        topic       TEXT        NOT NULL,
+        kafka_part  INT         NOT NULL,
+        kafka_off   BIGINT      NOT NULL,
+        payload     BYTEA,
+        error       TEXT        NOT NULL,
+        failed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY (topic, kafka_part, kafka_off)
+    )
+    """,
+]
 
-CREATE TABLE IF NOT EXISTS flight_events (
-    event_time    TIMESTAMPTZ      NOT NULL,
-    icao24        TEXT             NOT NULL,
-    callsign      TEXT             NOT NULL,
-    lat           DOUBLE PRECISION NOT NULL,
-    lon           DOUBLE PRECISION NOT NULL,
-    altitude_m    DOUBLE PRECISION NOT NULL,
-    velocity_ms   DOUBLE PRECISION NOT NULL,
-    heading       DOUBLE PRECISION NOT NULL,
-    ingest_time   TIMESTAMPTZ      NOT NULL,
-    partition_key TEXT             NOT NULL,
-    trace_id      TEXT             NOT NULL,
-    -- Stamped by the database at write time, so end-to-end latency
-    -- (event_time -> durably stored) is a property of the row, not of whatever
-    -- clock the benchmark script happens to read.
-    processed_at  TIMESTAMPTZ      NOT NULL DEFAULT now(),
-    -- Idempotency key. A hypertable's unique index must include the
-    -- partitioning column, which event_time already is.
-    UNIQUE (icao24, event_time)
-);
-
-ALTER TABLE flight_events
-    ADD COLUMN IF NOT EXISTS processed_at TIMESTAMPTZ NOT NULL DEFAULT now();
-
-SELECT create_hypertable('flight_events', 'event_time', if_not_exists => TRUE);
-
-CREATE INDEX IF NOT EXISTS flight_events_partition_idx
-    ON flight_events (partition_key, event_time DESC);
-"""
+# Arbitrary constant naming "contrail schema init" for pg_advisory_xact_lock.
+SCHEMA_LOCK_ID = 7_251_094_113
 
 INSERT = """
 INSERT INTO flight_events (
@@ -78,10 +99,42 @@ async def connect(dsn: str, **kwargs) -> asyncpg.Pool:
     return await asyncpg.create_pool(dsn, **kwargs)
 
 
-async def ensure_schema(pool: asyncpg.Pool) -> None:
+async def ensure_schema(pool: asyncpg.Pool, retention_days: int | None = None) -> None:
+    """Create or upgrade the schema. Safe to call from several processes at once.
+
+    Runs in one transaction behind a transaction-scoped advisory lock: concurrent
+    starters (sink workers, benchmark scripts) queue up instead of racing through
+    `create_hypertable`, and the lock is released by commit or rollback, so a crashed
+    initialiser can never leave it held.
+
+    `retention_days` (default: the RETENTION_DAYS setting, itself off by default) adds a
+    TimescaleDB policy that drops chunks older than that. Left unset, nothing is ever
+    dropped and nothing already configured is touched. To change or remove by hand:
+        SELECT remove_retention_policy('flight_events');
+        SELECT add_retention_policy('flight_events', INTERVAL '30 days');
+    """
+    if retention_days is None:
+        retention_days = get_settings().retention_days
     async with pool.acquire() as conn:
-        await conn.execute(SCHEMA)
-    log.info("schema ready", extra={"table": "flight_events"})
+        # TimescaleDB wants this as the first command of a session, so it goes before
+        # the transaction and the lock. Two starters can still race on a database that
+        # has never had the extension; the loser's error is the extension already
+        # existing, which is the state we wanted.
+        try:
+            await conn.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
+        except (asyncpg.UniqueViolationError, asyncpg.DuplicateObjectError):
+            pass
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", SCHEMA_LOCK_ID)
+        for step in SCHEMA_STEPS:
+            await conn.execute(step)
+        if retention_days is not None:
+            await conn.execute("SELECT remove_retention_policy('flight_events', if_exists => TRUE)")
+            await conn.execute(
+                "SELECT add_retention_policy('flight_events', make_interval(days => $1))",
+                retention_days,
+            )
+    log.info("schema ready", extra={"table": "flight_events", "retention_days": retention_days})
 
 
 async def insert_events(pool: asyncpg.Pool, events: list[FlightState]) -> int:
@@ -116,6 +169,18 @@ async def insert_events(pool: asyncpg.Pool, events: list[FlightState]) -> int:
         status = await conn.execute(INSERT, *[list(c) for c in cols])
     # asyncpg returns the command tag, e.g. "INSERT 0 42".
     return int(status.rsplit(" ", 1)[1])
+
+
+async def quarantine(
+    pool: asyncpg.Pool, rows: list[tuple[str, int, int, bytes | None, str]]
+) -> None:
+    """Park (topic, partition, offset, payload, error) rows in the dead-letter table."""
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            "INSERT INTO flight_events_dead (topic, kafka_part, kafka_off, payload, error)"
+            " VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+            rows,
+        )
 
 
 async def count_events(pool: asyncpg.Pool, icao24s: list[str] | None = None) -> int:

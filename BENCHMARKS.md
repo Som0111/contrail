@@ -6,6 +6,28 @@ result here can be re-run. Nothing in this file is estimated, extrapolated, or i
 Machine for all runs unless stated otherwise: Intel Core i7-5500U @ 2.40 GHz (2 cores / 4 threads),
 15.9 GB RAM, Windows 10 Pro 10.0.19045, Docker Desktop 29.7.2 (WSL2, kernel 6.18.33.2), containers on Python 3.12.14 / glibc 2.41.
 
+## Method and what is saved
+
+New runs repeat each benchmark (`--runs`, default 3) and report **median with min-max**, not one
+draw. Claim 1 repeats over consecutive seeds, since it is a pure function of the seed; claim 2
+repeats the whole static-vs-adaptive comparison, which varies with real scheduling. Each run saves
+JSON under `benchmarks/results/` with the git commit (and whether the tree was dirty), Python,
+platform, CPU/RAM, compose image digests when docker is reachable, the full configuration and
+the per-run timing (claim 2: startup, load, drain). The tables for a result are generated, not typed:
+
+    python -m scripts.render_benchmarks benchmarks/results/<file>.json
+
+Claim 2 is also measured across a workload grid (burst size and length, baseline rate, per-worker
+cap, worker ceiling, several static pool sizes) with `python -m scripts.sweep_control`, which records
+shed counts, peak lag, time to stabilise after the burst, scale actions, actions fired during
+steady baseline load (false triggers), p95/p99 latency and the benchmark process's CPU and peak
+memory.
+
+**The tables below predate this method, except the 2026-10-17 three-run re-run under Claim 2b.** They are single runs on the machine above, with no saved
+commit or image digests, so treat them as one observation each until re-run with `--runs 3`.
+No CI performance gate is built on them: a threshold from one run on one machine would fail or
+pass on noise.
+
 ---
 
 # Claim #1 — Event-time windowing vs a processing-time baseline
@@ -208,8 +230,7 @@ Four workers at 250 ev/s each is 1,000 ev/s against a 720 ev/s burst, so scaling
 completely and the shed path was correctly never reached. Shedding is exercised in the Phase 1.4
 integration run (at max workers with lag still growing 248/s for 3 consecutive samples: 1,816 events
 dropped across 12 named geographic cells, released once lag drained at -207/s), and can be forced
-here with `--max-workers 2`. That variant has not been run, so no shed figures are claimed in this
-table.
+here with `--max-workers 2`. That variant is Claim 2b below; this table makes no shed claims.
 
 Also note the static arm is pinned at **one** worker. That is the honest baseline for "no
 adaptation", but it is not the strongest possible fixed configuration: a static pool of 4 would have
@@ -249,6 +270,49 @@ Identical to claim 2 except the worker cap. Same harness, same controller, same 
 | p99 latency | 117.02s | **19.04s** | 6.1x lower |
 | events stored | 44,880 (76.3%) | 44,242 (75.2%) | *lower, deliberately* |
 | events shed | 0 | **14,668** | counted, cells named |
+
+## Re-run: 3 runs, 2026-10-17
+
+The same benchmark repeated three times with the new harness (`--max-workers 2 --runs 3`), reported
+as median [min - max]. Evidence for Claim 2b; it agrees with the single run above.
+
+**Reproduce:** `docker compose --profile dev run --rm --no-deps tests python -m scripts.benchmark_control --max-workers 2 --runs 3`
+
+| | |
+|---|---|
+| load | 60 aircraft; 120 ev/s for 30s -> **720 ev/s (6x) for 70s** -> 120 ev/s for 40s -> 60s drain; **58,800 events** published per run |
+| per-worker cap | 250 ev/s; static arm pinned at 1 worker, adaptive arm 1-2 workers |
+| seed / runs | 20260827; 3 runs, each a static arm then an adaptive arm; 1,212s total |
+| stack state | demo generator, pipeline and windowing stopped for the run, so the two CPU cores were not shared with them |
+| code | run from the working tree on top of commit `52a49b7` with uncommitted changes (not committed at the time). The result file's own commit and image-digest fields are empty because the harness ran inside the container, where neither git nor docker is available |
+| environment | Python 3.12.15, Linux 6.18.33.2 on WSL2 (4 CPUs and about 8 GB visible to the container), same laptop as above |
+
+| | static (1 worker) | adaptive (1-2, shedding) |
+|---|---|---|
+| peak lag | 34,040 [33,800 - 35,420] | **8,320** [8,280 - 8,760] |
+| final lag | **15,160** [14,980 - 17,100] | **0** [0 - 0] |
+| time to stabilise after the burst | **never** (0 of 3 runs) | **24s** [20 - 26] |
+| p50 latency | 53.17s [52.18 - 55.87] | **9.65s** [9.12 - 10.04] |
+| p95 latency | 116.41s [108.46 - 118.63] | **16.70s** [16.11 - 17.89] |
+| p99 latency | 120.93s [113.75 - 121.16] | **18.97s** [18.30 - 21.33] |
+| max latency | 122.25s [116.17 - 122.49] | 21.50s [20.57 - 23.26] |
+| events stored | 75.07% [71.77 - 75.37] of published | 75.04% [74.61 - 75.48] |
+| events shed | 0 | **14,695** [14,415 - 15,061], about 25% of published |
+| scale actions applied | 0 (the 3 decisions it logged were observed only) | **4** [4 - 4] |
+| false triggers during steady baseline load | 0 | **0** |
+
+"Time to stabilise" is the time from the end of the burst until lag stays at or below 200 for three
+consecutive samples. The static arm stores about as large a share as the adaptive arm only because it is
+still draining a backlog when the run ends; the adaptive arm's 75% is the deliberate cost of shedding.
+
+Not quoted from this run: CPU seconds and peak memory (the benchmark process's peak resident memory is a
+high-water mark shared by both arms, so it cannot be attributed to one), and throughput, which this
+benchmark does not measure. The accounting excess described under "The honest cost" below appears here
+too (shed plus stored exceeded published by a median of 18 events, at most 129, under 0.3%).
+
+The saved result is `control-20261017T114424Z.json` (not committed). Three runs on one machine bound
+the run-to-run spread; they do not show how the result moves with burst size, burst length or worker
+cap, which is what `scripts/sweep_control.py` is for and has not been run.
 
 ## Lag trajectory — the actual claim
 
