@@ -35,8 +35,10 @@ from datetime import UTC, datetime
 from typing import AsyncIterator
 
 import httpx
+from pydantic import ValidationError
 
-from src.common.config import get_settings
+from src.common import metrics
+from src.common.config import get_settings, parse_bbox
 from src.common.logging import configure
 from src.common.models import FlightState
 
@@ -57,6 +59,10 @@ class OpenSkyStats:
     received: int = 0
     emitted: int = 0
     skipped_missing_position: int = 0
+    # A row that is present but unusable: wrong shape, wrong types, or a value the
+    # FlightState contract rejects. Kept apart from missing-position rows, which are
+    # ordinary and expected; a rising count here means the feed or our parser changed.
+    skipped_malformed: int = 0
     # Two different things, deliberately not one counter. A substitution swaps in
     # another real measurement (geometric altitude for barometric); a repair
     # invents a value because none was reported. Merging them would let "we
@@ -83,6 +89,15 @@ class BoundingBox:
 
 def parse_state(row: list, stats: OpenSkyStats) -> FlightState | None:
     """Turn one OpenSky state vector into a FlightState, or None if unusable."""
+    try:
+        return _parse_state(row, stats)
+    except (ValidationError, KeyError, IndexError, TypeError, ValueError, OverflowError, OSError) as exc:
+        stats.skipped_malformed += 1
+        log.warning("malformed opensky row skipped", extra={"error": type(exc).__name__})
+        return None
+
+
+def _parse_state(row: list, stats: OpenSkyStats) -> FlightState | None:
     lat, lon, when = row[LAT], row[LON], row[TIME_POSITION]
     if lat is None or lon is None or when is None:
         stats.skipped_missing_position += 1
@@ -180,7 +195,12 @@ class OpenSkySource:
             self.stats.errors += 1
             log.warning("opensky returned non-JSON", extra={"error": str(exc)})
             return None
-        return payload.get("states") or []
+        states = payload.get("states") if isinstance(payload, dict) else False
+        if states is not None and not isinstance(states, list):
+            self.stats.skipped_malformed += 1
+            log.warning("opensky payload has unexpected shape", extra={"type": type(payload).__name__})
+            return []
+        return states or []
 
     async def stream(self) -> AsyncIterator[FlightState]:
         client = self._client or httpx.AsyncClient(headers={"User-Agent": "contrail/0.2"})
@@ -209,15 +229,23 @@ class OpenSkySource:
                 self.stats.polls += 1
                 self.stats.received += len(rows)
                 for row in rows:
+                    metrics.INGEST_EVENTS.labels("fetched").inc()
+                    malformed_before = self.stats.skipped_malformed
                     state = parse_state(row, self.stats)
-                    if state is not None:
-                        self.stats.emitted += 1
-                        yield state
+                    if state is None:
+                        metrics.INGEST_EVENTS.labels(
+                            "parse_failed" if self.stats.skipped_malformed > malformed_before
+                            else "skipped"
+                        ).inc()
+                        continue
+                    self.stats.emitted += 1
+                    yield state
 
                 log.info(
                     "opensky poll",
                     extra={"received": len(rows), "emitted": self.stats.emitted,
                            "skipped": self.stats.skipped_missing_position,
+                           "malformed": self.stats.skipped_malformed,
                            "substituted_alt": self.stats.substituted_altitude,
                            "repaired": self.stats.repaired_fields},
                 )
@@ -245,8 +273,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
 def bbox_from(spec: str | None) -> BoundingBox | None:
     if not spec:
         return None
-    lamin, lomin, lamax, lomax = (float(x) for x in spec.split(","))
-    return BoundingBox(lamin, lomin, lamax, lomax)
+    box = parse_bbox(spec)
+    return BoundingBox(*box) if box else None
 
 
 async def _main(argv=None) -> None:

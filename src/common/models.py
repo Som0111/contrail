@@ -18,13 +18,14 @@ GRID_DEG = 5.0
 
 
 class FlightState(BaseModel):
-    icao24: str
-    callsign: str
-    lat: float = Field(ge=-90.0, le=90.0)
-    lon: float = Field(ge=-180.0, le=180.0)
-    altitude_m: float
-    velocity_ms: float
-    heading: float = Field(ge=0.0, lt=360.0)
+    icao24: str = Field(pattern=r"^[0-9a-f]{6}$")  # 24-bit ICAO address, lowercase hex
+    callsign: str = Field(min_length=1, max_length=8, pattern=r"^[\x20-\x7e]+$")  # ICAO max is 8
+    lat: float = Field(ge=-90.0, le=90.0, allow_inf_nan=False)
+    lon: float = Field(ge=-180.0, le=180.0, allow_inf_nan=False)
+    # -500 m is below the Dead Sea shore; barometric readings under it are sensor garbage.
+    altitude_m: float = Field(ge=-500.0, allow_inf_nan=False)
+    velocity_ms: float = Field(ge=0.0, allow_inf_nan=False)
+    heading: float = Field(ge=0.0, lt=360.0, allow_inf_nan=False)
     event_time: datetime
     ingest_time: datetime
 

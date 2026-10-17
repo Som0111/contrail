@@ -1,5 +1,17 @@
 name: contrail
 
+# Local-development stack. Every published port except the API's is bound to
+# BIND_HOST, which defaults to loopback: databases, the broker and the dashboards
+# are not reachable from the network unless you set BIND_HOST=0.0.0.0 on purpose.
+#
+# Images are pinned to exact version tags, not digests; .github/dependabot.yml
+# proposes bumps as reviewable PRs, and that is the update policy.
+#
+# Data: the only persistent volume is `timescale-data` (flight_events and the
+# dead-letter table). Redis, Redpanda, Prometheus and Grafana state is ephemeral.
+#   docker compose down        keeps timescale-data
+#   docker compose down -v     DELETES it
+
 services:
   redpanda:
     image: redpandadata/redpanda:v24.2.18
@@ -12,8 +24,8 @@ services:
       - --kafka-addr=INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092
       - --advertise-kafka-addr=INTERNAL://redpanda:29092,EXTERNAL://localhost:9092
     ports:
-      - "9092:9092"
-      - "9644:9644"
+      - "${BIND_HOST:-127.0.0.1}:9092:9092"
+      - "${BIND_HOST:-127.0.0.1}:9644:9644"
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 5s
@@ -27,8 +39,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-contrail}
       POSTGRES_USER: ${POSTGRES_USER:-contrail}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-contrail}
+    # Flushes and checkpoints on SIGTERM; killing it early forces crash recovery.
+    stop_grace_period: 60s
     ports:
-      - "5432:5432"
+      # Host side is configurable: a local PostgreSQL commonly already owns 5432.
+      - "${BIND_HOST:-127.0.0.1}:${TIMESCALE_HOST_PORT:-5432}:5432"
     volumes:
       - timescale-data:/var/lib/postgresql/data
     healthcheck:
@@ -41,7 +56,7 @@ services:
   redis:
     image: redis:7.4-alpine
     ports:
-      - "6379:6379"
+      - "${BIND_HOST:-127.0.0.1}:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -63,8 +78,9 @@ services:
       REDIS_URL: redis://redis:6379/0
       RATE_LIMIT_RPS: ${RATE_LIMIT_RPS:-10}
       RATE_LIMIT_BURST: ${RATE_LIMIT_BURST:-20}
+    # The application port; bind it to loopback too with API_BIND_HOST=127.0.0.1.
     ports:
-      - "8000:8000"
+      - "${API_BIND_HOST:-0.0.0.0}:8000:8000"
     depends_on:
       redpanda: {condition: service_healthy}
       timescaledb: {condition: service_healthy}
@@ -87,7 +103,19 @@ services:
     # Same shell wrapper as `pipeline`: keeps python a child rather than PID 1, so
     # a crash can actually be simulated and the restart policy applies. Without it
     # this service cannot be chaos-tested at all.
-    command: sh -c "python -m src.windowing.service; echo 'windowing exited'; exit 1"
+    #
+    # `trap` forwards SIGTERM to python (sh as PID 1 would otherwise die without
+    # telling it), so `docker compose stop` lets the service publish what it has and
+    # commit offsets; `wait` twice because the first returns when the trap fires.
+    stop_grace_period: 30s
+    command:
+      - sh
+      - -c
+      - |
+        python -m src.windowing.service & pid=$$!
+        trap 'kill -TERM $$pid' TERM INT
+        wait $$pid; wait $$pid
+        echo 'windowing exited'; exit 1
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
@@ -111,7 +139,18 @@ services:
     # as an operator stop so the restart policy is skipped. With python as a child,
     # killing it is a genuine application crash -- the shell exits non-zero and
     # the restart policy does what it exists to do.
-    command: sh -c "python -m src.control.supervisor --max-rate 250 --max-workers 4; echo 'supervisor exited'; exit 1"
+    #
+    # The trap forwards SIGTERM so workers finish their batch and commit; see the
+    # windowing service for why it is written this way.
+    stop_grace_period: 30s
+    command:
+      - sh
+      - -c
+      - |
+        python -m src.control.supervisor --max-rate 250 --max-workers 4 & pid=$$!
+        trap 'kill -TERM $$pid' TERM INT
+        wait $$pid; wait $$pid
+        echo 'supervisor exited'; exit 1
     environment:
       KAFKA_BOOTSTRAP: redpanda:29092
       REDIS_URL: redis://redis:6379/0
@@ -149,21 +188,23 @@ services:
       - --storage.tsdb.retention.time=6h
     volumes:
       - ./ops/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-    ports: ["9090:9090"]
+    ports: ["${BIND_HOST:-127.0.0.1}:9090:9090"]
     networks: [contrail]
 
   grafana:
     image: grafana/grafana:11.4.0
     environment:
       GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Anonymous read-only viewing is fine on loopback (the default bind) and not on a
+      # network: set GRAFANA_ANONYMOUS=false together with any BIND_HOST other than 127.0.0.1.
+      GF_AUTH_ANONYMOUS_ENABLED: "${GRAFANA_ANONYMOUS:-true}"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
       GF_USERS_DEFAULT_THEME: light
     volumes:
       - ./ops/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./ops/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports: ["3000:3000"]
+    ports: ["${BIND_HOST:-127.0.0.1}:3000:3000"]
     depends_on: [prometheus]
     networks: [contrail]
 

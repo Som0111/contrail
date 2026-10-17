@@ -60,6 +60,7 @@ class Aggregator:
         # Bucketed by the event's own window so eviction is O(buckets), not a
         # scan of millions of keys.
         self._seen: dict[datetime, set[tuple[str, datetime]]] = {}
+        self.evicted_keys = 0  # running total, for the live service's metrics
 
     def seen_before(self, event: FlightState) -> bool:
         """Check *and* mark. True means this event has already been counted.
@@ -89,7 +90,7 @@ class Aggregator:
         """
         stale = [b for b in self._seen if b < cutoff]
         for bucket in stale:
-            del self._seen[bucket]
+            self.evicted_keys += len(self._seen.pop(bucket))
         return len(stale)
 
     @property

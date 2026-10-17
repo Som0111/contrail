@@ -1,12 +1,33 @@
 name: CI
 
+# Three tiers, split by cost:
+#   unit         every push and pull request; seconds. Lint + tests/unit.
+#   integration  pull requests (and on demand); a few minutes. Real Redpanda, Redis,
+#                TimescaleDB and the API via docker compose.
+#   long         weekly and on demand; the benchmarks and the kill-and-recover chaos
+#                test. Slow and noisy, so never a merge gate.
 on:
   push:
   pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Action versions are tags, kept current by .github/dependabot.yml, which proposes
+# bumps as reviewable PRs. Pin to commit SHAs instead if the threat model includes a
+# compromised upstream action; that is the update policy, not an oversight.
 jobs:
-  check:
+  unit:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -16,14 +37,81 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
 
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
 
       - name: Lint
         run: ruff check src tests scripts load
 
-      # Unit tests only. The integration suite needs live Redpanda, TimescaleDB,
-      # Redis and the API, and the benchmarks need minutes of sustained load --
-      # neither belongs in a per-push check for a project this size. They run
-      # locally via `docker compose run --rm tests pytest -q`.
       - name: Unit tests
         run: pytest tests/unit -q
+
+  integration:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    needs: unit
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      # The `tests` service waits for a healthy API, which waits for Redpanda,
+      # TimescaleDB and Redis. Nothing else from the compose file is started, so the
+      # suite is not racing the demo generator and pipeline for the same topics.
+      - name: Integration tests
+        run: >
+          docker compose --profile dev run --rm tests
+          pytest tests/integration -q -ra --junitxml=/app/tests/junit-integration.xml
+
+      - name: Collect service logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt || true
+
+      - name: Upload reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-failure
+          path: |
+            tests/junit-integration.xml
+            compose-logs.txt
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile dev down -v --remove-orphans
+
+  long:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same commands as README "Reproducing the claims". Results are only
+      # meaningful relative to each other on one runner; they are not the numbers
+      # published in BENCHMARKS.md, which came from a specific machine.
+      - name: Claim 1, windowing benchmark
+        run: docker compose run --rm --no-deps tests python -m scripts.benchmark_windowing
+
+      - name: Claim 3, deterministic replay
+        run: docker compose --profile dev run --rm tests pytest -q tests/integration/test_replay_determinism.py
+
+      - name: Chaos, kill and recover
+        run: |
+          docker compose up -d --build --wait
+          BURST_RATE=12 bash scripts/chaos_kill.sh 45
+
+      - name: Collect service logs
+        if: failure()
+        run: docker compose logs --no-color --timestamps > compose-logs.txt || true
+
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-failure
+          path: compose-logs.txt
+          if-no-files-found: ignore
+
+      - name: Tear down
+        if: always()
+        run: docker compose --profile dev down -v --remove-orphans

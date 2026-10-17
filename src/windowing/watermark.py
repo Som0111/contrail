@@ -27,7 +27,9 @@ counted and logged, never dropped in silence.
 import argparse
 import asyncio
 import logging
-from collections.abc import Callable
+import math
+import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -69,6 +71,19 @@ class WatermarkResult:
     final_watermark: datetime | None = None
 
 
+def min_seen_retention_windows(window_s: int, allowed_lateness_s: float) -> int:
+    """Fewest dedup windows that still recognise a redelivery as a duplicate.
+
+    A key is evicted once its window is `retention` windows behind the closed
+    frontier, and the frontier trails the newest event by the lateness bound. Any
+    retention of at least one keeps a key for as long as its window is open, so an
+    aggregate is never double counted; this formula additionally keeps it for one
+    lateness bound past that, so a redelivery inside the bound is still reported as
+    a duplicate rather than as a late event.
+    """
+    return math.ceil(allowed_lateness_s / window_s) + 1
+
+
 class WatermarkProcessor:
     """Streaming event-time windowing. Feed it events in arrival order."""
 
@@ -80,8 +95,44 @@ class WatermarkProcessor:
         seen_retention_windows: int | None = None,
         late_retention: int | None = None,
         retain_windows: bool = True,
+        idle_timeout_s: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        await_sources: Iterable[str] = (),
     ) -> None:
+        if idle_timeout_s is not None and idle_timeout_s <= allowed_lateness_s:
+            # A source that is merely slow by less than the lateness bound would be
+            # dropped from the minimum, and its still-on-time events then arrive late.
+            raise ValueError(
+                f"idle_timeout_s ({idle_timeout_s}) must exceed allowed_lateness_s "
+                f"({allowed_lateness_s})"
+            )
+        if seen_retention_windows is not None:
+            need = min_seen_retention_windows(window_s, allowed_lateness_s)
+            if seen_retention_windows < need:
+                log.warning(
+                    "dedup retention shorter than the lateness bound; redeliveries inside it "
+                    "will be reported as late events, not duplicates",
+                    extra={"seen_retention_windows": seen_retention_windows, "recommended": need},
+                )
         self.on_finalize = on_finalize
+        # Idle-source handling is the one place this class may read a wall clock, so
+        # it is opt-in. With idle_timeout_s=None the clock is never touched and replay
+        # stays a pure function of the input.
+        self.idle_timeout_s = idle_timeout_s
+        self._clock = clock
+        self._last_seen: dict[str, float] = {}
+        self._idle: set[str] = set()
+        # Sources known to have a backlog to deliver (a restarted service replaying from its
+        # last safe offset). Until each has delivered once the watermark holds, because a
+        # source we have not heard from yet would otherwise be ignored by the minimum and the
+        # partitions that arrive first would close windows the backlog still belongs to.
+        # Empty by default, which leaves a fresh live start and every replay unchanged.
+        self._awaiting = set(await_sources)
+        if idle_timeout_s is not None:
+            for s in self._awaiting:  # a backlog source that never shows up times out like any other
+                self._last_seen[s] = clock()
+        self.idle_transitions = 0  # source went idle
+        self.resume_transitions = 0  # idle source delivered again
         # All three default to unbounded, which is what replay and the benchmarks
         # need. The live service, which never exits, sets all three -- see
         # DESIGN_DECISIONS.md 2.8.
@@ -110,16 +161,77 @@ class WatermarkProcessor:
         return self._late_total
 
     @property
+    def finalized_before(self) -> datetime | None:
+        """Windows ending at or before this are closed; later events for them are late."""
+        return self._finalized_before
+
+    @property
     def max_event_time(self) -> datetime | None:
         return max(self._max_by_source.values(), default=None)
+
+    @property
+    def duplicate_count(self) -> int:
+        """Events suppressed as duplicates so far."""
+        return self._result.duplicates
+
+    @property
+    def seen_size(self) -> int:
+        """Dedup keys currently retained."""
+        return self._agg.seen_size
+
+    @property
+    def seen_evicted(self) -> int:
+        """Dedup keys evicted so far."""
+        return self._agg.evicted_keys
+
+    @property
+    def idle_sources(self) -> frozenset[str]:
+        return frozenset(self._idle)
 
     @property
     def watermark(self) -> datetime | None:
         if not self._max_by_source:
             return None
-        return min(self._max_by_source.values()) - self.allowed_lateness
+        if any(s not in self._max_by_source and s not in self._idle for s in self._awaiting):
+            return None
+        # Idle sources drop out of the minimum. If every source is idle there is
+        # nothing to advance on, so fall back to all of them and hold position.
+        active = [t for s, t in self._max_by_source.items() if s not in self._idle]
+        return min(active or self._max_by_source.values()) - self.allowed_lateness
+
+    def tick(self) -> None:
+        """Mark sources silent for `idle_timeout_s` idle and close what that releases.
+
+        Has to be called periodically, since a silent source produces no event to
+        trigger it. A no-op unless `idle_timeout_s` is set.
+        """
+        if self.idle_timeout_s is None:
+            return
+        now = self._clock()
+        newly = [
+            s for s, seen in self._last_seen.items()
+            if s not in self._idle and now - seen >= self.idle_timeout_s
+        ]
+        for s in newly:
+            self._idle.add(s)
+            self.idle_transitions += 1
+            log.warning("source idle, excluded from watermark",
+                        extra={"source": s, "idle_after_s": self.idle_timeout_s,
+                               "idle_sources": len(self._idle)})
+        if newly:
+            self._finalize()
 
     def process(self, event: FlightState, source: str = "") -> None:
+        if self.idle_timeout_s is not None:
+            self._last_seen[source] = self._clock()
+            if source in self._idle:
+                # Rejoin with the mark it had when it went quiet; its events for windows
+                # closed in the meantime take the ordinary late path below.
+                self._idle.discard(source)
+                self.resume_transitions += 1
+                log.warning("idle source resumed, rejoined watermark",
+                            extra={"source": source, "idle_sources": len(self._idle)})
+            self.tick()
         # Duplicate first: a repeat of a late event is a duplicate, not a second
         # late report. Keeps this identical to the naive baseline's dedup.
         if self._agg.seen_before(event):
@@ -158,6 +270,9 @@ class WatermarkProcessor:
         current = self._max_by_source.get(source)
         if current is None or event_time > current:
             self._max_by_source[source] = event_time
+        self._finalize()
+
+    def _finalize(self) -> None:
         mark = self.watermark
         if mark is None:
             return

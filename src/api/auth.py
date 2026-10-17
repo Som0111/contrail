@@ -9,16 +9,18 @@ assert rather than assume.
 import logging
 import secrets
 import time
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from src.common.config import DEV_JWT_SECRET as DEV_SECRET
 from src.common.config import get_settings
 
 ALGORITHM = "HS256"
-DEV_SECRET = "dev-only-change-me"
 bearer = HTTPBearer(auto_error=False)
 log = logging.getLogger("contrail.api.auth")
 
@@ -117,19 +119,61 @@ class TokenBucket:
 
 
 class RateLimiter:
-    # ponytail: unbounded dict of buckets, one per client id. Fine for a single
-    # process with a handful of clients; needs eviction or Redis if this ever
-    # runs multi-instance or faces the open internet.
-    def __init__(self, rate: float, burst: float) -> None:
+    """Per-client token buckets, bounded in count and in age.
+
+    PER-PROCESS: buckets live in this process's memory. Run N replicas and a client
+    can spend N times the configured rate; sharing the limit needs a shared store
+    (Redis), which this deliberately does not have.
+
+    Buckets sit in least-recently-used order, so eviction only ever looks at the
+    front: idle ones go first, and when the cap is hit the stalest is dropped. A
+    client id an attacker can mint at will (spoofed addresses) therefore cannot grow
+    memory past `max_buckets`; the price is that flooding with fresh ids can reset
+    another client's bucket, which only hands that client a fresh burst.
+    """
+
+    def __init__(
+        self, rate: float, burst: float, idle_ttl_s: float = 600.0, max_buckets: int = 10_000,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.rate, self.burst = rate, burst
-        self._buckets: dict[str, TokenBucket] = {}
+        self.idle_ttl_s, self.max_buckets = idle_ttl_s, max_buckets
+        self._clock = clock
+        self._buckets: OrderedDict[str, TokenBucket] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._buckets)
 
     def allow(self, client: str) -> bool:
+        # No await in here, so on one event loop concurrent requests cannot interleave.
+        now = self._clock()
+        while self._buckets:
+            oldest = next(iter(self._buckets.values()))
+            if oldest.updated is not None and now - oldest.updated < self.idle_ttl_s:
+                break
+            self._buckets.popitem(last=False)  # idle: a fresh bucket is full anyway
         bucket = self._buckets.get(client)
         if bucket is None:
+            if len(self._buckets) >= self.max_buckets:
+                self._buckets.popitem(last=False)
             bucket = self._buckets[client] = TokenBucket(self.rate, self.burst)
-        return bucket.take()
+        else:
+            self._buckets.move_to_end(client)
+        return bucket.take(now)
 
 
 def client_id(request: Request) -> str:
-    return request.client.host if request.client else "unknown"
+    """Who to rate-limit: the TCP peer, unless told how many proxies sit in front.
+
+    X-Forwarded-For is client-controlled text, so it is ignored by default
+    (TRUSTED_PROXY_HOPS=0). With N trusted proxies, each appends the address it saw,
+    so the entry N places from the right is the first one our own infrastructure
+    vouches for; anything to its left may be forged and is never read.
+    """
+    peer = request.client.host if request.client else "unknown"
+    hops = get_settings().trusted_proxy_hops
+    if hops > 0:
+        forwarded = [p.strip() for p in request.headers.get("x-forwarded-for", "").split(",") if p.strip()]
+        if len(forwarded) >= hops:
+            return forwarded[-hops]
+    return peer

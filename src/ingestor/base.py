@@ -7,12 +7,14 @@ running.
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from typing import AsyncIterator, Protocol, runtime_checkable
 
-from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
 from aiokafka.errors import TopicAlreadyExistsError
 
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.models import FlightState
 
@@ -85,6 +87,7 @@ async def publish(
                 key=event.partition_key.encode(),
             )
             published += 1
+            metrics.INGEST_EVENTS.labels("published").inc()
             if published % 1000 == 0:
                 log.info("published %d events", published)
     finally:
@@ -155,6 +158,80 @@ async def collect(
     # which differs run to run. Determinism (Phase 1.6) needs the tie broken by
     # something intrinsic to the event, so the replayed stream is byte-identical
     # every time regardless of how the broker interleaved the partitions.
-    events.sort(key=lambda e: (e.ingest_time, e.icao24, e.event_time))
+    _arrival_order(events)
     log.info("collected %d events from %s", len(events), topic)
     return events
+
+
+def _arrival_order(events: list[FlightState]) -> None:
+    events.sort(key=lambda e: (e.ingest_time, e.icao24, e.event_time))
+
+
+class IncompleteStream(RuntimeError):
+    """The recording could not be read to its end, so any digest of it would cover a suffix."""
+
+
+async def collect_sealed(
+    bootstrap: str,
+    topic: str,
+    duration_s: float,
+    poll_timeout_ms: int = 1000,
+    on_progress: Callable[[int], Awaitable[None]] | None = None,
+) -> tuple[list[FlightState], dict[int, int]]:
+    """Read exactly the records the topic held when this call started.
+
+    Unlike `collect()`, completion is decided by offsets, not by silence: the end
+    offset of every partition is snapshotted up front and reading stops only when
+    each partition's position has reached it. A slow broker therefore delays the
+    result instead of truncating it, and if `duration_s` runs out first this
+    raises `IncompleteStream` rather than returning a prefix. Records appended
+    after the snapshot are ignored, so a topic that is still being recorded to is
+    sealed at the moment of the call; the snapshot is returned so callers can
+    report exactly what was sealed.
+
+    No consumer group: nothing can resume from, or commit to, anyone's offsets.
+    """
+    await ensure_topic(bootstrap, topic, get_settings().kafka_partitions)
+    consumer = AIOKafkaConsumer(
+        bootstrap_servers=bootstrap, group_id=None, enable_auto_commit=False,
+    )
+    await consumer.start()
+    events: list[FlightState] = []
+    try:
+        await consumer.topics()  # forces a metadata fetch; partitions_for_topic only reads the cache
+        parts = consumer.partitions_for_topic(topic)
+        if not parts:
+            raise IncompleteStream(f"no partition metadata for {topic}")
+        tps = [TopicPartition(topic, p) for p in sorted(parts)]
+        consumer.assign(tps)
+        await consumer.seek_to_beginning(*tps)
+        ends = await consumer.end_offsets(tps)
+        begins = await consumer.beginning_offsets(tps)
+        if all(ends[tp] <= begins[tp] for tp in tps):
+            raise IncompleteStream(f"{topic} is empty")
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + duration_s
+        while True:
+            positions = {tp: await consumer.position(tp) for tp in tps}
+            if all(positions[tp] >= ends[tp] for tp in tps):
+                break
+            if loop.time() >= deadline:
+                behind = {tp.partition: (positions[tp], ends[tp])
+                          for tp in tps if positions[tp] < ends[tp]}
+                raise IncompleteStream(
+                    f"deadline hit before the end of {topic}; (position, end) by partition: {behind}"
+                )
+            batches = await consumer.getmany(timeout_ms=poll_timeout_ms)
+            for tp, records in batches.items():
+                events.extend(
+                    FlightState.model_validate_json(r.value)
+                    for r in records if r.offset < ends[tp]
+                )
+            if on_progress and events:
+                await on_progress(len(events))
+    finally:
+        await consumer.stop()
+    _arrival_order(events)
+    log.info("sealed %d events from %s", len(events), topic)
+    return events, {tp.partition: ends[tp] for tp in tps}

@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 from math import cos, radians, sin
 from typing import AsyncIterator, Iterator
 
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.models import FlightState
 
@@ -187,6 +188,7 @@ class SyntheticSource:
             behind = t0 + offset - loop.time()
             if behind > 0:
                 await asyncio.sleep(behind)
+            metrics.INGEST_EVENTS.labels("fetched").inc()
             yield event
 
 

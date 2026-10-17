@@ -1,0 +1,55 @@
+name: Security
+
+# Dependency vulnerabilities (pip-audit) and committed secrets (detect-secrets).
+# The audit also runs weekly, because new advisories appear without any change here.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    - cron: "41 4 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # .secrets.baseline lists the known dev placeholders (committed on purpose, see
+      # .env.example and src/common/config.py). Anything new fails the job. After a
+      # deliberate addition: detect-secrets scan --baseline .secrets.baseline
+      - name: Scan tracked files
+        run: |
+          pip install detect-secrets==1.5.0
+          git ls-files -z | xargs -0 detect-secrets-hook --baseline .secrets.baseline
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A pull request is informed by the audit but not blocked by advisories it did not
+    # cause; the scheduled and manual runs do fail, so an open advisory stays visible.
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Audit locked runtime and dev dependencies
+        run: |
+          pip install pip-audit==2.10.1
+          pip-audit -r requirements-dev.txt --no-deps --disable-pip --format json --output audit.json || status=$?
+          pip-audit -r requirements-dev.txt --no-deps --disable-pip | tee -a "$GITHUB_STEP_SUMMARY"
+          exit ${status:-0}
+      - name: Upload audit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pip-audit
+          path: audit.json
+          if-no-files-found: ignore

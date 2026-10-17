@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import logging
 
+from src.common import metrics
 from src.common.config import get_settings
 from src.common.logging import configure
 from src.ingestor.base import EventSource, publish
@@ -56,6 +57,8 @@ def _parse_args(argv=None) -> argparse.Namespace:
 async def _main(argv=None) -> None:
     args = _parse_args(argv)
     configure(get_settings().log_level)
+    if get_settings().metrics_port:
+        metrics.serve(get_settings().metrics_port)
     source = build_source(args)
     log.info("ingestion starting", extra={"source": source.name, "topic": args.topic})
     await publish(source, args.bootstrap, args.topic, args.partitions)

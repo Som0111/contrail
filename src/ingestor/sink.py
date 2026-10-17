@@ -9,12 +9,16 @@ No exactly-once machinery, no dedup cache in the consumer.
 import argparse
 import asyncio
 import logging
+import random
 import signal
 from datetime import UTC, datetime
 from collections.abc import Callable
 from dataclasses import dataclass
 
+import asyncpg
 from aiokafka import AIOKafkaConsumer
+from aiokafka.errors import KafkaError
+from pydantic import ValidationError
 
 from src.common.config import get_settings
 from src.ingestor.base import ensure_topic
@@ -33,6 +37,63 @@ class SinkStats:
     suppressed: int = 0
     shed: int = 0
     batches: int = 0
+    quarantined: int = 0
+
+
+# Worth retrying: the database may well be back in a moment.
+TRANSIENT = (
+    OSError, TimeoutError, asyncpg.PostgresConnectionError,
+    asyncpg.InsufficientResourcesError, asyncpg.CannotConnectNowError,
+)
+MAX_ATTEMPTS = 5
+BACKOFF_BASE_S = 0.2
+
+
+class RetriesExhausted(Exception):
+    """Every attempt failed transiently. Not a verdict on the data, so never quarantined."""
+
+
+async def _write(pool, events: list[FlightState]) -> int:
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return await timescale.insert_events(pool, events)
+        except TRANSIENT as exc:
+            if attempt == MAX_ATTEMPTS:
+                metrics.SINK_RETRIES_EXHAUSTED.inc()
+                raise RetriesExhausted(str(exc)) from exc
+            metrics.SINK_RETRIES.inc()
+            delay = BACKOFF_BASE_S * 2 ** (attempt - 1) * random.uniform(0.5, 1.5)
+            log.warning("db write failed, retrying",
+                        extra={"attempt": attempt, "delay_s": round(delay, 2), "error": repr(exc)})
+            await asyncio.sleep(delay)
+
+
+async def report_lag(consumer) -> None:
+    """Per-partition lag as this consumer sees it: last fetched high watermark - position."""
+    for tp in consumer.assignment():
+        high = consumer.highwater(tp)
+        if high is not None:
+            lag = max(0, high - await consumer.position(tp))
+            metrics.SINK_PARTITION_LAG.labels(str(tp.partition)).set(lag)
+
+
+async def write_isolating(pool, pairs: list[tuple]) -> tuple[int, list[tuple]]:
+    """Insert (record, event) pairs; return (rows inserted, [(record, error)] rejected).
+
+    A permanent database error is bisected down to the record causing it, so one
+    poison record costs O(log n) extra writes instead of the whole batch.
+    """
+    if not pairs:
+        return 0, []
+    try:
+        return await _write(pool, [e for _, e in pairs]), []
+    except (asyncpg.PostgresError, asyncpg.DataError) as exc:
+        if len(pairs) == 1:
+            return 0, [(pairs[0][0], repr(exc))]
+    mid = len(pairs) // 2
+    n1, bad1 = await write_isolating(pool, pairs[:mid])
+    n2, bad2 = await write_isolating(pool, pairs[mid:])
+    return n1 + n2, bad1 + bad2
 
 
 async def run(
@@ -80,11 +141,19 @@ async def run(
                 continue
             idle_for = 0.0
 
-            consumed = [FlightState.model_validate_json(r.value) for r in records]
+            rejected: list[tuple] = []  # (record, error) for the dead-letter table
+            parsed: list[tuple] = []
+            for r in records:
+                try:
+                    parsed.append((r, FlightState.model_validate_json(r.value)))
+                except ValidationError as exc:
+                    rejected.append((r, f"invalid event: {exc.error_count()} validation errors"))
+            consumed = [e for _, e in parsed]
             events = consumed
             shed = 0
             if event_filter is not None:
-                events = [e for e in consumed if event_filter(e)]
+                parsed = [(r, e) for r, e in parsed if event_filter(e)]
+                events = [e for _, e in parsed]
                 shed = len(consumed) - len(events)
 
             if max_rate:
@@ -100,11 +169,30 @@ async def run(
                 # fixed. Deserialising and filtering a record is not free, but it
                 # is far cheaper than the insert this models.
                 await asyncio.sleep(len(events) / max_rate)
-            inserted = await timescale.insert_events(pool, events) if events else 0
-            # Shed records are committed too: they were consumed and deliberately
-            # discarded, so replaying them would undo the shedding decision.
-            await consumer.commit()
+            inserted, bad = await write_isolating(pool, parsed)
+            rejected += bad
+            bad_ids = {id(r) for r, _ in bad}
+            events = [e for r, e in parsed if id(r) not in bad_ids]
+            if rejected:
+                await timescale.quarantine(pool, [
+                    (r.topic, r.partition, r.offset, r.value, err) for r, err in rejected
+                ])
+                metrics.EVENTS.labels("quarantined").inc(len(rejected))
+                stats.quarantined += len(rejected)
+                log.error("records quarantined", extra={
+                    "count": len(rejected),
+                    "offsets": [f"{r.partition}:{r.offset}" for r, _ in rejected[:10]],
+                })
+            # Shed and quarantined records are committed too: both were consumed and
+            # deliberately set aside, so replaying them would undo that decision.
+            try:
+                await consumer.commit()
+            except KafkaError as exc:
+                # The write is durable; an uncommitted batch just replays as a no-op.
+                metrics.SINK_COMMIT_FAILURES.inc()
+                log.warning("offset commit failed", extra={"error": repr(exc)})
 
+            await report_lag(consumer)
             now = datetime.now(UTC)
             for e in events:
                 metrics.E2E_LATENCY.observe((now - e.event_time).total_seconds())
@@ -126,7 +214,7 @@ async def run(
                     "inserted": inserted,
                     "suppressed": len(events) - inserted,
                     "shed": shed,
-                    "first_trace_id": timescale.trace_id(consumed[0]),
+                    "first_trace_id": timescale.trace_id(consumed[0]) if consumed else None,
                     "offsets": {
                         f"{tp.topic}:{tp.partition}": (rs[0].offset, rs[-1].offset)
                         for tp, rs in batches.items()
@@ -145,6 +233,7 @@ async def run(
                 "suppressed": stats.suppressed,
                 "shed": stats.shed,
                 "batches": stats.batches,
+                "quarantined": stats.quarantined,
             },
         )
     return stats
