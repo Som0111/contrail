@@ -1,6 +1,6 @@
 # Runtime dependencies, as direct pins. requirements.txt is generated from this file:
 #   uv pip compile requirements.in --universal --python-version 3.12 --generate-hashes -o requirements.txt
-fastapi==0.115.6
+fastapi==0.143.0
 uvicorn[standard]==0.34.0
 pydantic==2.10.4
 pydantic-settings==2.7.0
